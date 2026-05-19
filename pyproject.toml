@@ -1,0 +1,28 @@
+[project]
+name = "cua-bench"
+version = "0.1.0"
+description = "Computer-use agent benchmark harness with FastAPI backend and React dashboard."
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.111.0",
+  "uvicorn[standard]>=0.30.0",
+  "playwright>=1.44.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.7.0",
+  "supabase>=2.4.0",
+  "anthropic>=0.102.0",
+  "pillow>=12.2.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.4.0",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

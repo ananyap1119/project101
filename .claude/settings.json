@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(uv add anthropic)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from backend.agents.optimized import OptimizedAgent; print\\('OptimizedAgent OK'\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\playwright.exe install chromium 2>&1)",
+      "PowerShell($env:PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = \"1\"; .\\\\.venv\\\\Scripts\\\\python.exe -m playwright install chromium --with-deps 2>&1 | Select-Object -Last 10)",
+      "Read(//c/Users/anany/AppData/Local/ms-playwright/**)",
+      "PowerShell(if \\($env:ANTHROPIC_API_KEY\\) { Write-Output \"API key is set in environment \\(length: $\\($env:ANTHROPIC_API_KEY.Length\\)\\)\" } else { $envFile = Get-Content \"C:\\\\Users\\\\anany\\\\cua-bench\\\\.env\" -ErrorAction SilentlyContinue; $key = \\($envFile | Where-Object { $_ -match \"^ANTHROPIC_API_KEY=\\(.+\\)\" } | Select-Object -First 1\\); if \\($key -match \"=\\(.+\\)\"\\) { Write-Output \"API key found in .env \\(length: $\\($Matches[1].Trim\\(\\).Length\\)\\)\" } else { Write-Output \"No API key found in environment or .env\" } })",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; cd C:\\\\Users\\\\anany\\\\cua-bench; .\\\\.venv\\\\Scripts\\\\python.exe scripts/run_baseline.py 2>&1)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import urllib3; print\\('urllib3 ok'\\)\" 2>&1)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from backend.agents.baseline import BaselineAgent; print\\('import OK'\\)\" 2>&1)",
+      "PowerShell($env:PYTHONIOENCODING = \"utf-8\"; $env:PYTHONWARNINGS = \"ignore::urllib3.exceptions.InsecureRequestWarning\"; cd C:\\\\Users\\\\anany\\\\cua-bench; .\\\\.venv\\\\Scripts\\\\python.exe scripts/run_baseline.py --headed --mock 2>&1)",
+      "Bash(cat /tmp/backend2.log | tail -20)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"uvicorn backend.main\")",
+      "Bash(uv run *)",
+      "Bash(curl -s http://localhost:8000/health)"
+    ]
+  }
+}
