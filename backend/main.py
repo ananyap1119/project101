@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 # Playwright spawns Chromium via create_subprocess_exec which requires ProactorEventLoop on Windows.
 if sys.platform == "win32":
@@ -36,10 +37,13 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.agents.baseline import BaselineAgent
-from backend.agents.optimized import Flags, OptimizedAgent
+from backend.agents.optimized import Flags, OptimizedAgent, SarvamActionRouter
 from backend.instrumentation.meter import BudgetExceededError, MeterEvent, RunMeter
 from backend.models.sarvam import SarvamClient
+from backend.tasks.blinkit import BlinkitTask
+from backend.tasks.cricket import CricketTask
 from backend.tasks.ntes import NTESTask
+from backend.tasks.weather import WeatherTask
 
 
 _sarvam: SarvamClient | None = None
@@ -172,6 +176,10 @@ def _get_sarvam() -> SarvamClient:
 class RunRequest(BaseModel):
     task: str = Field(default="ntes")
     headed: bool = Field(default=False)
+    product: str = Field(default="milk")
+    location: str = Field(default="560001")
+    city: str = Field(default="Bangalore")
+    question: str = Field(default="")
     # Optimised agent layers: 1=DOM, 2=summarisation, 4=speculation (cascade always on).
     # Default [1,2,4] = all layers.  Set e.g. [1,2] to disable speculation.
     layers: list[int] = Field(default=[1, 2, 4])
@@ -215,12 +223,27 @@ async def clear_benchmark_results() -> dict[str, str]:
 
 @app.post("/run")
 async def run_both(request: RunRequest) -> dict[str, str]:
-    if request.task != "ntes":
+    if request.task not in {"ntes", "blinkit", "weather"}:
         raise HTTPException(status_code=404, detail=f"Unknown task: {request.task}")
 
     run_id = str(uuid.uuid4())
     meter = RunMeter(run_id)
-    task = NTESTask(headed=request.headed, config_name="full_optimized")
+    if request.task == "blinkit":
+        task = BlinkitTask(
+            headed=request.headed,
+            config_name="full_optimized",
+            product=request.product,
+            location=request.location,
+        )
+    elif request.task == "weather":
+        task = WeatherTask(
+            headed=request.headed,
+            config_name="full_optimized",
+            city=request.city,
+            question=request.question,
+        )
+    else:
+        task = NTESTask(headed=request.headed, config_name="full_optimized")
     METERS[run_id] = meter
     RUNS[run_id] = {
         "run_id": run_id,
@@ -231,10 +254,13 @@ async def run_both(request: RunRequest) -> dict[str, str]:
 
     async def execute() -> None:
         task.reset()
-        agents = [
-            BaselineAgent(meter),
-            OptimizedAgent(meter, flags=Flags.from_layers(request.layers)),
-        ]
+        if request.task in {"blinkit", "weather"}:
+            agents = [OptimizedAgent(meter, flags=Flags.from_layers(request.layers))]
+        else:
+            agents = [
+                BaselineAgent(meter),
+                OptimizedAgent(meter, flags=Flags.from_layers(request.layers)),
+            ]
         try:
             results = await asyncio.gather(*(agent.run(task) for agent in agents))
             RUNS[run_id]["status"] = "completed"
@@ -278,16 +304,58 @@ async def trace(run_id: str) -> dict[str, Any]:
 class VoiceReplyRequest(BaseModel):
     run_id: str
     success: bool
-    train_number: str
     reply_language: str = "hi-IN"
+    task_type: str = "train_status"
+    extracted_answer: str = ""
+    user_question: str = ""
+
+
+def _build_task_from_intent(intent: dict) -> Any | None:
+    """Construct the right task object from a parsed intent dict."""
+    task_type = intent.get("task", "unknown")
+    if task_type == "train_status":
+        raw = intent.get("train_number") or ""
+        num = re.sub(r"\D", "", raw)
+        if not (4 <= len(num) <= 5):
+            return None
+        return NTESTask(config_name="full_optimized", train_number=num)
+    if task_type == "cricket":
+        q = intent.get("cricket_query") or intent.get("team") or ""
+        return CricketTask(config_name="full_optimized", query=q)
+    if task_type == "weather":
+        return WeatherTask(
+            config_name="full_optimized",
+            city=intent.get("city") or "Bangalore",
+            question=intent.get("weather_question") or "",
+        )
+    if task_type == "blinkit":
+        product = intent.get("product") or "milk"
+        return BlinkitTask(config_name="full_optimized", product=product)
+    return None
+
+
+def _clarification_for(task_type: str, intent: dict) -> str:
+    if task_type == "train_status":
+        raw = intent.get("train_number") or ""
+        if not raw:
+            return "Train number not detected. Please say a 4-5 digit train number."
+        return f"'{raw}' doesn't look like a valid train number. Please say a 4-5 digit number."
+    if task_type == "blinkit":
+        return "Which product are you looking for on Blinkit? Please say the product name."
+    if task_type == "unknown":
+        return (
+            "I can help with train status, cricket score, weather, or Blinkit prices. "
+            "Please say what you need."
+        )
+    return "Could not understand the query with sufficient confidence. Please try again."
 
 
 @app.post("/voice")
 async def voice_run(
     audio: UploadFile = File(...),
-    language_hint: str = Form(default="hi-IN"),
+    language_hint: str = Form(default="auto"),
 ) -> dict:
-    """Transcribe audio → extract NTES intent → kick off benchmark if intent is clear."""
+    """Transcribe → unified intent extraction → kick off appropriate benchmark."""
     sarvam = _get_sarvam()
     audio_bytes = await audio.read()
     print(
@@ -295,128 +363,138 @@ async def voice_run(
         f"content_type={audio.content_type!r} filename={audio.filename!r}",
         flush=True,
     )
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="No audio was recorded. Please hold the mic while speaking.")
+
     saarika_audio_bytes = await _prepare_audio_for_saarika(audio, audio_bytes)
 
     try:
-        transcription = await sarvam.saarika_transcribe(saarika_audio_bytes, language_hint)
+        stt_lang = language_hint if language_hint not in ("auto", "") else "hi-IN"
+        transcription = await sarvam.saarika_transcribe(saarika_audio_bytes, stt_lang)
     except Exception as exc:
+        print(f"[voice] saarika EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=502, detail=f"Saarika transcription failed: {exc}")
 
     transcript = transcription["transcript"]
+    detected_lang = transcription.get("language_detected", language_hint)
+
     if not transcript:
         return {
-            "run_id": None,
-            "transcript": "",
-            "intent": {"task": "unknown", "train_number": None,
-                       "reply_language": language_hint, "confidence": 0.0},
+            "run_id": None, "transcript": "",
+            "intent": {"task": "unknown", "reply_language": detected_lang, "confidence": 0.0},
             "action": "clarification_needed",
             "clarification_message": "Sorry, I couldn't hear that. Please try again.",
         }
 
     try:
-        intent = await sarvam.extract_intent_for_ntes(transcript)
+        intent = await sarvam.extract_intent(transcript)
     except Exception as exc:
+        print(f"[voice] intent EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=502, detail=f"Intent extraction failed: {exc}")
 
+    # Saarika language detection is more reliable for reply language
+    if detected_lang and detected_lang != language_hint:
+        intent.setdefault("reply_language", detected_lang)
+
+    task_type = intent.get("task", "unknown")
     conf = float(intent.get("confidence", 0.0))
-    task = intent.get("task", "unknown")
-    train_number_raw = intent.get("train_number") or ""
-    train_number = re.sub(r"\D", "", train_number_raw)   # strip non-digits
+    reply_lang = intent.get("reply_language", detected_lang)
 
-    if task == "train_status" and conf >= 0.6 and not train_number:
+    task_obj = _build_task_from_intent(intent) if conf >= 0.5 else None
+
+    if task_obj is None:
         return {
             "run_id": None,
             "transcript": transcript,
             "intent": intent,
             "action": "clarification_needed",
-            "clarification_message": (
-                "Train number not detected. Please include the train number, "
-                "e.g. 'Train 22691'. Train number include karein."
-            ),
+            "clarification_message": _clarification_for(task_type, intent),
         }
 
-    if task == "train_status" and conf >= 0.6 and not (4 <= len(train_number) <= 5):
-        return {
-            "run_id": None,
-            "transcript": transcript,
-            "intent": intent,
-            "action": "clarification_needed",
-            "clarification_message": (
-                f"'{train_number_raw}' doesn't look like a valid train number. "
-                "Please say a 4-5 digit number, e.g. 'Train 22691'."
-            ),
-        }
+    run_id = str(uuid.uuid4())
+    meter = RunMeter(run_id)
+    METERS[run_id] = meter
+    RUNS[run_id] = {
+        "run_id": run_id,
+        "task_type": task_type,
+        "task_name": task_obj.name,
+        "status": "running",
+        "trace": [],
+    }
 
-    if task == "train_status" and train_number and conf >= 0.6:
-        run_id = str(uuid.uuid4())
-        meter  = RunMeter(run_id)
-        ntes_task = NTESTask(headed=False, config_name="full_optimized",
-                             train_number=train_number)
-        METERS[run_id] = meter
-        RUNS[run_id] = {"run_id": run_id, "task": "ntes", "status": "running", "trace": []}
+    async def _execute_voice() -> None:
+        try:
+            await meter.publish(
+                MeterEvent(
+                    run_id=run_id,
+                    agent="optimized",
+                    event="usage",
+                    elapsed_seconds=0.0,
+                    current_step="starting",
+                    current_model="initializing",
+                    detail=f"Starting {task_type} task",
+                )
+            )
+            task_obj.reset()
+            if os.environ.get("OPENROUTER_API_KEY"):
+                flags = Flags(dom=True, summarization=True, cascade=True, speculation=False)
+                router = None
+            else:
+                print("[voice] OPENROUTER_API_KEY missing; using Sarvam action router", flush=True)
+                flags = Flags(dom=True, summarization=True, cascade=False, speculation=False)
+                router = SarvamActionRouter()
+            # Voice runs use optimized agent only; baseline requires a separate model key.
+            agents: list = [OptimizedAgent(meter, flags=flags, router=router)]
+            results = await asyncio.gather(*(a.run(task_obj) for a in agents))
+            RUNS[run_id]["status"] = "completed"
+            RUNS[run_id]["results"] = [r.model_dump() for r in results]
+        except Exception as exc:
+            print(f"[voice] execute EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
+            RUNS[run_id]["status"] = "failed"
+            RUNS[run_id]["error"] = str(exc)
+            await meter.publish(
+                MeterEvent(
+                    run_id=run_id,
+                    agent="optimized",
+                    event="error",
+                    elapsed_seconds=round(time.perf_counter() - meter.started_at, 2),
+                    current_step="failed_to_start",
+                    current_model="none",
+                    detail=str(exc),
+                )
+            )
+        finally:
+            RUNS[run_id]["trace"] = [e.model_dump() for e in meter.trace]
+            await meter.close()
 
-        async def _execute_voice() -> None:
-            ntes_task.reset()
-            agents = [BaselineAgent(meter), OptimizedAgent(meter)]
-            try:
-                results = await asyncio.gather(*(a.run(ntes_task) for a in agents))
-                RUNS[run_id]["status"] = "completed"
-                RUNS[run_id]["results"] = [r.model_dump() for r in results]
-            except Exception as exc:
-                RUNS[run_id]["status"] = "failed"
-                RUNS[run_id]["error"] = str(exc)
-            finally:
-                RUNS[run_id]["trace"] = [e.model_dump() for e in meter.trace]
-                await meter.close()
-
-        asyncio.create_task(_execute_voice())
-        return {
-            "run_id": run_id,
-            "transcript": transcript,
-            "intent": intent,
-            "action": "started",
-            "clarification_message": None,
-        }
-
-    # Not enough confidence or unknown task — ask for clarification
-    if task != "train_status":
-        msg = ("Please say a train status query, e.g. 'Train 22691 kahan hai'. "
-               "Kripya train query bolein.")
-    elif not train_number:
-        msg = ("Train number not detected. Please include the train number, "
-               "e.g. 'Train 22691'. Train number include karein.")
-    else:
-        msg = "Could not understand the query with sufficient confidence. Please try again."
-
+    asyncio.create_task(_execute_voice())
     return {
-        "run_id": None,
+        "run_id": run_id,
         "transcript": transcript,
         "intent": intent,
-        "action": "clarification_needed",
-        "clarification_message": msg,
+        "action": "started",
+        "clarification_message": None,
     }
 
 
 @app.post("/voice/reply")
 async def voice_reply(request: VoiceReplyRequest) -> Response:
-    """Generate and synthesise a spoken reply for the end of a voice-triggered run."""
+    """Use Sarvam-M to generate a natural reply, then synthesise with Bulbul."""
     sarvam = _get_sarvam()
-    lang   = request.reply_language
-    num    = request.train_number
-
-    if request.success:
-        text = {
-            "hi-IN": f"Train {num} ka status check ho gaya. Dashboard mein result dekh sakte hain.",
-            "kn-IN": f"Train {num} ra status check aaagide. Dashboard nodi.",
-        }.get(lang, f"Train {num} status has been checked. See the dashboard for results.")
-    else:
-        text = {
-            "hi-IN": f"Train {num} ka status abhi nahi mila. Phir se try karein.",
-            "kn-IN": f"Train {num} ra status sigalyilla. Matte try maadi.",
-        }.get(lang, f"Could not fetch status for train {num}. Please try again.")
 
     try:
-        audio_bytes = await sarvam.bulbul_synthesize(text, lang)
+        text = await sarvam.generate_voice_reply(
+            task_type=request.task_type,
+            result_snippet=request.extracted_answer,
+            reply_language=request.reply_language,
+            success=request.success,
+            user_question=request.user_question,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Reply generation failed: {exc}")
+
+    try:
+        audio_bytes = await sarvam.bulbul_synthesize(text, request.reply_language)
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Bulbul synthesis failed: {exc}")
 

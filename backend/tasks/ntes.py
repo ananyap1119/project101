@@ -111,6 +111,9 @@ class NTESTask(BaseModel):
             return RICH_SUCCESS(page_text)
         return SIMPLE_SUCCESS(page_text)
 
+    def extract_answer(self, page_text: str) -> str:
+        return extract_status_string(page_text)
+
     def reset(self) -> None:
         if DOWNLOADS_DIR.exists():
             shutil.rmtree(DOWNLOADS_DIR)

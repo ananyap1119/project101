@@ -7,8 +7,11 @@ agent can be exercised in mock mode without any credentials.
 from __future__ import annotations
 
 import asyncio
+import json as _json_mod
 import os
+import re
 import time
+import uuid
 import warnings
 from dataclasses import dataclass
 
@@ -19,6 +22,47 @@ warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWar
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 SARVAM_BASE = "https://api.sarvam.ai/v1"
+
+_JSON_CT = {"Content-Type": "application/json; charset=utf-8"}
+
+
+def _json_bytes(obj: object) -> bytes:
+    """Encode object as UTF-8 JSON bytes — avoids Windows charmap issues with httpx json=."""
+    return _json_mod.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
+def _dedup_reply(text: str) -> str:
+    """Remove repeated sentences — guards against Sarvam-M repetition loops."""
+    import re as _re
+    parts = _re.split(r"(?<=[।.!?])\s+", text.strip())
+    seen: list[str] = []
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.append(p)
+        if len(seen) >= 2:   # hard cap: 2 sentences max
+            break
+    return " ".join(seen) if seen else text[:120]
+
+
+def _build_multipart(fields: dict[str, str], file_name: str, file_bytes: bytes, file_mime: str) -> tuple[bytes, str]:
+    """Build a multipart/form-data body as pure bytes — avoids httpx charmap issues on Windows."""
+    boundary = uuid.uuid4().hex.encode()
+    parts: list[bytes] = []
+    for key, value in fields.items():
+        parts.append(
+            b"--" + boundary + b"\r\n"
+            b'Content-Disposition: form-data; name="' + key.encode() + b'"\r\n'
+            b"\r\n" + value.encode("utf-8") + b"\r\n"
+        )
+    parts.append(
+        b"--" + boundary + b"\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="' + file_name.encode() + b'"\r\n'
+        b"Content-Type: " + file_mime.encode() + b"\r\n"
+        b"\r\n" + file_bytes + b"\r\n"
+    )
+    parts.append(b"--" + boundary + b"--\r\n")
+    return b"".join(parts), f"multipart/form-data; boundary={boundary.decode()}"
 
 
 def _sniff_audio(data: bytes) -> tuple[str, str]:
@@ -35,12 +79,26 @@ def _sniff_audio(data: bytes) -> tuple[str, str]:
         return "recording.webm", "audio/webm"
     return "recording.mp4", "audio/mp4"   # safe default for unknown
 SARVAM_API_BASE = "https://api.sarvam.ai"    # base for Saarika/Bulbul (no /v1/ prefix)
-SARVAM_MODEL = "sarvam-m"   # legacy 24-B; kept for backward compat with codebase refs
+_DEPRECATED_CHAT_MODELS = {"sarvam-m"}
 
-# Known-good Bulbul speaker IDs per language.  Primary first; rest are fallbacks.
+
+def _chat_model_name() -> str:
+    model = os.environ.get("SARVAM_CHAT_MODEL", "sarvam-30b").strip() or "sarvam-30b"
+    if model in _DEPRECATED_CHAT_MODELS:
+        print(
+            f"[sarvam] {model} is deprecated; using sarvam-30b instead",
+            flush=True,
+        )
+        return "sarvam-30b"
+    return model
+
+
+SARVAM_MODEL = _chat_model_name()
+
+# Known-good Bulbul speaker IDs per language.  Female voices first.
 _BULBUL_SPEAKERS: dict[str, list[str]] = {
-    "hi-IN": ["anushka", "arvind", "amol", "diya"],
-    "en-IN": ["anushka", "arvind", "meera"],
+    "hi-IN": ["diya", "anushka", "arvind", "amol"],
+    "en-IN": ["meera", "anushka", "arvind"],
     "kn-IN": ["anushka", "arvind"],
     "ta-IN": ["anushka"],
     "te-IN": ["anushka"],
@@ -88,6 +146,7 @@ class SarvamClient:
             self._http = httpx.AsyncClient(
                 base_url=SARVAM_BASE,
                 headers={
+                    "api-subscription-key": api_key,
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
@@ -123,13 +182,15 @@ class SarvamClient:
             ],
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "reasoning_effort": None,
             "response_format": {"type": "json_object"},   # suppress think blocks
         }
-        r = await self._http.post("/chat/completions", json=payload)
+        r = await self._http.post("/chat/completions", content=_json_bytes(payload), headers=_JSON_CT)
         if r.status_code == 400 and "response_format" in r.text:
-            # API doesn't support response_format — retry without it
             payload.pop("response_format", None)
-            r = await self._http.post("/chat/completions", json=payload)
+            r = await self._http.post("/chat/completions", content=_json_bytes(payload), headers=_JSON_CT)
+        if not r.is_success:
+            print(f"[sarvam-chat] {r.status_code} error: {r.text[:500]}", flush=True)
         r.raise_for_status()
         latency_ms = int((time.perf_counter() - t0) * 1000)
         data = r.json()
@@ -245,13 +306,22 @@ class SarvamClient:
                 "language_detected": language_code,
                 "duration_seconds": 2.5,
             }
-        import io as _io
         fname, mime = _sniff_audio(audio_bytes)
         print(f"[saarika] sending {len(audio_bytes)} bytes as {fname} ({mime})", flush=True)
-        files = {"file": (fname, _io.BytesIO(audio_bytes), mime)}
-        data = {"model": "saarika:v2.5", "language_code": language_code, "mode": "transcribe"}
+        body, ct = _build_multipart(
+            {"model": "saarika:v2.5", "language_code": language_code, "mode": "transcribe"},
+            fname, audio_bytes, mime,
+        )
         t0 = time.perf_counter()
-        r = await self._api_http.post("/speech-to-text", files=files, data=data)
+        try:
+            r = await self._api_http.post(
+                "/speech-to-text",
+                content=body,
+                headers={"Content-Type": ct},
+            )
+        except Exception as net_exc:
+            print(f"[saarika] network exception: {type(net_exc).__name__}: {net_exc}", flush=True)
+            raise
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if not r.is_success:
             print(f"[saarika] {r.status_code} error: {r.text[:500]}", flush=True)
@@ -270,15 +340,15 @@ class SarvamClient:
         self,
         text: str,
         language_code: str = "hi-IN",
-        speaker: str = "anushka",
+        speaker: str = "",   # empty = use first (female) speaker for the language
         pace: float = 1.0,
     ) -> bytes:
         """Synthesise speech via Bulbul v2.  Returns raw WAV bytes."""
         if not self._live:
             return b""
         speakers = _BULBUL_SPEAKERS.get(language_code, _BULBUL_DEFAULT_SPEAKERS)
-        if speaker not in speakers:
-            speaker = speakers[0]
+        if not speaker or speaker not in speakers:
+            speaker = speakers[0]   # always female — female voices listed first
         payload = {
             "text": text[:2500],
             "target_language_code": language_code,
@@ -288,14 +358,14 @@ class SarvamClient:
             "output_audio_codec": "wav",
         }
         t0 = time.perf_counter()
-        r = await self._api_http.post("/text-to-speech", json=payload)
+        r = await self._api_http.post("/text-to-speech", content=_json_bytes(payload), headers=_JSON_CT)
         latency_ms = int((time.perf_counter() - t0) * 1000)
         if not r.is_success:
             print(f"[bulbul] {r.status_code} error: {r.text[:500]}", flush=True)
             # Retry with next-best speaker
             if len(speakers) > 1:
                 payload["speaker"] = speakers[1]
-                r = await self._api_http.post("/text-to-speech", json=payload)
+                r = await self._api_http.post("/text-to-speech", content=_json_bytes(payload), headers=_JSON_CT)
             if not r.is_success:
                 r.raise_for_status()
         import base64 as _b64
@@ -306,6 +376,163 @@ class SarvamClient:
         audio_bytes = _b64.b64decode(audios[0])
         print(f"  [bulbul] {len(audio_bytes)} bytes in {latency_ms}ms", flush=True)
         return audio_bytes
+
+    async def extract_intent(self, transcript: str) -> dict:
+        """Unified intent extraction for all supported tasks from any Indian language.
+
+        Returns a dict with keys:
+          task, reply_language, confidence,
+          train_number (train_status), city (weather),
+          product (blinkit), team (cricket).
+        """
+        system = """\
+You are a voice command parser for an Indian AI assistant that handles:
+  - Train live running status (NTES)
+  - Cricket match scores (Cricbuzz)
+  - Weather lookup (wttr.in)
+  - Grocery prices on Blinkit
+
+The transcript may be in Hindi, English, Kannada, Telugu, Tamil, Malayalam, or code-mixed.
+Return ONLY valid JSON — no markdown, no prose, no <think> tags:
+{
+  "task": "train_status" | "cricket" | "weather" | "blinkit" | "unknown",
+  "reply_language": "hi-IN" | "en-IN" | "kn-IN" | "te-IN" | "ta-IN" | "ml-IN",
+  "confidence": 0.0–1.0,
+  "train_number": "NNNNN" or null,
+  "city": "city name" or null,
+  "weather_question": "specific weather aspect asked" or null,
+  "product": "product name" or null,
+  "cricket_query": "team name, tournament name, or match description" or null
+}
+
+Rules:
+- train_status: mentions of train/rail/railu/gaadi/train numbers, "kahan hai", "late", "running status",
+  "ಯಾವ station", "எங்கே", spoken numbers ("baais chhe nau ek" = 22691)
+- cricket: "cricket", "match", "score", "IPL", "test", "wicket", "run", team/player names,
+  "ODI", "T20", "finals", "ಕ್ರಿಕೆಟ್", "क्रिकेट"
+- weather: "weather", "mausam", "barish", "rain", "garmi", "temperature", city + "mein kaisa",
+  "ಹವಾಮಾನ", "வானிலை", "వాతావరణం"
+- blinkit: "Blinkit", product names for instant delivery (milk/doodh/haalu, bread, eggs/anda,
+  vegetables, fruit, groceries), "kitna ka hai" for grocery items
+- train numbers: detect written digits ("22691") and spoken forms in any language
+- city for weather: extract city name IN ENGLISH (e.g. "Bangalore", "Mumbai"). null if not mentioned.
+- weather_question: IN ENGLISH, the specific aspect asked — "will it rain", "temperature", "humidity", etc.
+  null if just general weather. Examples: "will it rain today", "is it hot", "rain chance".
+- product for blinkit: extract the product name IN ENGLISH (e.g. "milk", "eggs", "bread").
+- cricket_query: extract the FULL subject IN ENGLISH — team name (India, CSK), tournament (IPL, World Cup),
+  or specific match description (IPL Finals 2026, India vs Australia). Include year if mentioned.
+  ALWAYS write this field in English, even if the transcript is in Hindi/Kannada/Tamil.
+  Examples: "IPL Finals 2026", "India vs Australia", "CSK", "World Cup final". null if general query.
+- Language detection: Kannada script/words → "kn-IN", Hindi → "hi-IN",
+  Telugu → "te-IN", Tamil → "ta-IN", Malayalam → "ml-IN", else "en-IN"
+- confidence = 1.0 if task + params are clear, 0.7 if task clear but params inferred, 0.3 if uncertain"""
+
+        resp = await self.chat(system=system, user=f"Transcript: {transcript}", max_tokens=512)
+        raw = resp.text.strip()
+        import re as _re, json as _json
+
+        text = _re.sub(r"<think>.*?</think>", "", raw, flags=_re.DOTALL).strip()
+        if not text or text.startswith("<think>"):
+            text = _re.sub(r"<think>.*$", "", raw, flags=_re.DOTALL).strip()
+        if text.startswith("```"):
+            text = "\n".join(text.split("\n")[1:]).rstrip("`").strip()
+
+        try:
+            result = _json.loads(text)
+            print(f"  [intent] {result}", flush=True)
+            return result
+        except _json.JSONDecodeError:
+            pass
+
+        for candidate in (text + "}", text + '", "confidence": 0.5}'):
+            try:
+                result = _json.loads(candidate)
+                if "task" in result:
+                    print(f"  [intent] rescued {result}", flush=True)
+                    return result
+            except _json.JSONDecodeError:
+                pass
+
+        task_m  = _re.search(r'"task"\s*:\s*"([^"]+)"', raw)
+        lang_m  = _re.search(r'"reply_language"\s*:\s*"([^"]+)"', raw)
+        conf_m  = _re.search(r'"confidence"\s*:\s*([\d.]+)', raw)
+        if task_m:
+            return {
+                "task":           task_m.group(1),
+                "reply_language": lang_m.group(1) if lang_m else "hi-IN",
+                "confidence":     float(conf_m.group(1)) if conf_m else 0.5,
+                "train_number":     None,
+                "city":             None,
+                "weather_question": None,
+                "product":          None,
+                "cricket_query":    None,
+            }
+
+        print(f"  [intent] parse error: {raw[:200]!r}", flush=True)
+        return {"task": "unknown", "reply_language": "hi-IN", "confidence": 0.0,
+                "train_number": None, "city": None, "product": None, "cricket_query": None}
+
+    async def generate_voice_reply(
+        self,
+        task_type: str,
+        result_snippet: str,
+        reply_language: str,
+        success: bool,
+        user_question: str = "",
+    ) -> str:
+        """Use Sarvam-M to directly answer the user's question in their language."""
+        if not self._live:
+            return self._stub_reply(task_type, reply_language, success)
+
+        if not success or not result_snippet.strip():
+            return {
+                "hi-IN": "Kaam nahi ho paya. Thodi der baad dobara try karein.",
+                "kn-IN": "Kaarya aagalyilla. Swalpa samayadanantara matte try maadi.",
+                "ta-IN": "Seyal nadakkavillai. Thayavu seithu meedum muyarchi seyyungal.",
+                "te-IN": "Pani jarigindi ledu. Daya cheshu malli prayatninchandi.",
+                "ml-IN": "Pravshanam nadannilla. Daya vech veeendum shramikkuka.",
+            }.get(reply_language, "Sorry, could not complete the task. Please try again.")
+
+        system = (
+            f"You are a voice assistant. Reply in {reply_language}. "
+            "Write EXACTLY ONE sentence — no more. "
+            "For yes/no questions start with haan/nahi (Hindi), haudu/illa (Kannada), or yes/no. "
+            "Never repeat yourself. Never restate the question."
+        )
+        question_part = f'Question: "{user_question}"\n' if user_question else ""
+        # Keep snippet short — large input causes repetition loops
+        snippet = result_snippet[:250]
+        try:
+            resp = await self.chat(
+                system=system,
+                user=f"{question_part}Facts: {snippet}",
+                max_tokens=45,
+                temperature=0.0,
+            )
+            text = _dedup_reply(resp.text.strip())
+            text = re.split(r"(?<=[।.!?])\s+", text, maxsplit=1)[0].strip()
+            if text:
+                print(f"  [voice_reply] {text!r}", flush=True)
+                return text
+        except Exception as exc:
+            print(f"  [voice_reply] generation failed: {exc}", flush=True)
+
+        return {
+            "hi-IN": "Kaam ho gaya. Result mil gaya.",
+            "kn-IN": "Kaarya aagide. Result sigiide.",
+            "en-IN": "Done. Result found.",
+        }.get(reply_language, "Task completed.")
+
+    def _stub_reply(self, task_type: str, reply_language: str, success: bool) -> str:
+        if not success:
+            return "Could not complete the task. Please try again."
+        stubs = {
+            "train_status": {"hi-IN": "Train ka status check ho gaya.", "kn-IN": "Train status check aaagide.", "en-IN": "Train status checked."},
+            "cricket":      {"hi-IN": "Cricket score mil gaya.", "kn-IN": "Cricket score sigiide.", "en-IN": "Cricket score found."},
+            "weather":      {"hi-IN": "Mausam ki jaankari mil gayi.", "kn-IN": "Havamana mahiti sigiide.", "en-IN": "Weather info found."},
+            "blinkit":      {"hi-IN": "Blinkit pe daam mil gaya.", "kn-IN": "Blinkit price sigiide.", "en-IN": "Blinkit price found."},
+        }
+        return stubs.get(task_type, {}).get(reply_language, "Task completed.")
 
     async def extract_intent_for_ntes(self, transcript: str) -> dict:
         """Extract structured intent for NTES train-status queries.

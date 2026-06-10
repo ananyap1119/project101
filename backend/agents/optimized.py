@@ -46,8 +46,10 @@ from backend.agents.baseline import AgentResult
 from backend.agents.dom_extractor import DomSnapshot, DomElement, extract_dom, dom_to_prompt
 from backend.agents.summarizer import maybe_summarise
 from backend.instrumentation.meter import BudgetExceededError, MeterEvent, RunMeter
-from backend.models.router import ModelRouter, RouteDecision, TIER_DEEPSEEK
+from backend.models.router import CascadeStats, ModelRouter, RouteDecision, TIER_DEEPSEEK
+from backend.models.sarvam import SarvamClient
 from backend.tasks.ntes import DOWNLOADS_DIR, NTESTask, extract_status_string
+from typing import Any
 
 # Each agent saves to its own sub-directory so concurrent runs don't
 # cross-contaminate success checks.
@@ -78,9 +80,8 @@ _VIS_W, _VIS_H = 1280, 720
 # ── system prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM = """\
-You are a web browser automation agent navigating the NTES live train running \
-status website. Your ONLY goal is to answer the train status request for the \
-train number given by the user.
+You are a web browser automation agent. Your ONLY goal is to complete the task \
+described by the user.
 
 You receive:
   - The current URL
@@ -93,20 +94,18 @@ Start your response with "{".
 
 Respond with EXACTLY ONE JSON action object:
 
-  {"action":"click",  "n":3,                        "thought":"…","confidence":0.9}
-  {"action":"type",   "n":2, "text":"22691",         "thought":"…","confidence":0.9}
-  {"action":"press",  "key":"Enter",                 "thought":"…","confidence":0.95}
-  {"action":"scroll", "direction":"down",            "thought":"…","confidence":0.7}
-  {"action":"goto",   "url":"https://…",             "thought":"…","confidence":0.8}
-  {"action":"wait",                                  "thought":"…","confidence":0.6}
-  {"action":"done",                                  "thought":"…","confidence":1.0}
+  {"action":"click",  "n":3,                   "thought":"…","confidence":0.9}
+  {"action":"type",   "n":2, "text":"…",        "thought":"…","confidence":0.9}
+  {"action":"press",  "key":"Enter",            "thought":"…","confidence":0.95}
+  {"action":"scroll", "direction":"down",       "thought":"…","confidence":0.7}
+  {"action":"goto",   "url":"https://…",        "thought":"…","confidence":0.8}
+  {"action":"wait",                             "thought":"…","confidence":0.6}
+  {"action":"done",                             "thought":"…","confidence":1.0}
 
 Rules:
   - "n" is the element number from the INTERACTIVE ELEMENTS list.
-  - If you are not on NTES, immediately go to https://enquiry.indianrail.gov.in/mntes/
-  - Find the train search field, type train number 22691, and submit.
-  - Open the live running status result for train 22691.
-  - Signal "done" only after the visible page contains the requested answer.
+  - Navigate to the task website if you are not already there.
+  - Complete the task described in the goal and signal "done" once the answer is visible.
 """
 
 _SPECULATE_SYSTEM = """\
@@ -163,6 +162,40 @@ _MOCK_CYCLE: list[dict] = [
     {"action": "wait",  "thought": "settling",       "confidence": 0.6},
     {"action": "wait",  "thought": "still settling", "confidence": 0.55},
 ]
+
+_BLINKIT_PINCODE = "560001"
+_BLINKIT_LOCATION_MARKERS = (
+    "please provide your delivery location",
+    "search delivery location",
+    "select location",
+    "detect my location",
+)
+_BLINKIT_LOCATION_FIELD_SELECTORS = (
+    'input[placeholder*="delivery location" i]',
+    'input[placeholder*="location" i]',
+    '[role="textbox"][aria-label*="location" i]',
+    'text="Search delivery location"',
+    'text="Select Location"',
+)
+_BLINKIT_LOCATION_TRIGGER_SELECTORS = (
+    'button:has-text("Select Location")',
+    'button:has-text("Change Location")',
+    'div:has-text("Please provide your delivery location")',
+    'div:has-text("Select Location")',
+    '[data-testid*="location"]',
+)
+_BLINKIT_LOCATION_SUGGESTION_SELECTORS = (
+    '[role="option"]',
+    '[data-testid*="suggestion"]',
+    'div:has-text("560001")',
+    'div:has-text("Bengaluru")',
+    'div:has-text("Bangalore")',
+)
+_BLINKIT_SEARCH_SELECTORS = (
+    '[role="searchbox"]',
+    'input[placeholder^="Search" i]',
+    '[role="textbox"][placeholder*="Search" i]',
+)
 
 
 # ── action parsing ─────────────────────────────────────────────────────────────
@@ -290,6 +323,181 @@ async def _type_in_element(page, el: DomElement, text: str) -> tuple[str, str]:
     return "", ""
 
 
+def _is_blinkit_location_prompt(snap: DomSnapshot | None) -> bool:
+    if not snap or "blinkit.com" not in snap.url.lower():
+        return False
+    visible_text = " ".join(
+        [
+            snap.body_text,
+            " ".join(el.text for el in snap.elements),
+            " ".join(el.placeholder for el in snap.elements),
+        ]
+    ).lower()
+    return any(marker in visible_text for marker in _BLINKIT_LOCATION_MARKERS)
+
+
+async def _select_blinkit_location_suggestion(page, pincode: str = _BLINKIT_PINCODE) -> None:
+    await asyncio.sleep(1.2)
+    try:
+        clicked = await page.evaluate(
+            """pincode => {
+                const candidates = Array.from(document.querySelectorAll('div, button, [role="option"]'));
+                for (const el of candidates) {
+                    const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+                    const rect = el.getBoundingClientRect();
+                    if (
+                        text.includes(pincode) &&
+                        rect.width > 40 &&
+                        rect.width < Math.min(window.innerWidth, 900) &&
+                        rect.height > 12 &&
+                        rect.height < 160 &&
+                        rect.bottom > 0 &&
+                        rect.right > 0 &&
+                        rect.top < window.innerHeight &&
+                        rect.left < window.innerWidth
+                    ) {
+                        el.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            pincode,
+        )
+        if clicked:
+            await asyncio.sleep(1.5)
+            return
+    except Exception:
+        pass
+    try:
+        await page.keyboard.press("ArrowDown")
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(1.5)
+    except Exception:
+        pass
+    for selector in (*_BLINKIT_LOCATION_SUGGESTION_SELECTORS, 'button:has-text("Confirm")'):
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible(timeout=1_000):
+                await loc.click(timeout=2_000)
+                await asyncio.sleep(1.5)
+                return
+        except Exception:
+            continue
+
+
+async def _click_first_visible(page, selectors: tuple[str, ...], timeout: int = 1_000) -> bool:
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible(timeout=timeout):
+                await loc.click(timeout=2_000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _fill_first_visible(
+    page,
+    selectors: tuple[str, ...],
+    text: str,
+    timeout: int = 1_000,
+    reject_placeholder_words: tuple[str, ...] = (),
+) -> bool:
+    for selector in selectors:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible(timeout=timeout):
+                if reject_placeholder_words:
+                    placeholder = ""
+                    try:
+                        placeholder = (await loc.get_attribute("placeholder", timeout=500) or "").lower()
+                    except Exception:
+                        pass
+                    if any(word in placeholder for word in reject_placeholder_words):
+                        continue
+                await loc.click(timeout=2_000)
+                try:
+                    await loc.fill(text, timeout=2_000)
+                except Exception:
+                    await page.keyboard.press("Control+A")
+                    await page.keyboard.type(text, delay=25)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _blinkit_visible_text(page) -> str:
+    try:
+        return (await page.inner_text("body", timeout=2_000)).lower()
+    except Exception:
+        return ""
+
+
+async def _prepare_blinkit_for_product_search(page, task: Any) -> bool:
+    """Best-effort deterministic Blinkit setup before handing control to the model."""
+    if getattr(task, "name", "") != "blinkit" or "blinkit.com" not in page.url.lower():
+        return False
+
+    pincode = str(getattr(task, "location", _BLINKIT_PINCODE) or _BLINKIT_PINCODE)
+    product = str(getattr(task, "product", "") or "").strip()
+    changed = False
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=8_000)
+    except Exception:
+        pass
+
+    body_text = await _blinkit_visible_text(page)
+    needs_location = any(marker in body_text for marker in _BLINKIT_LOCATION_MARKERS)
+    if needs_location:
+        print(f"[opt] Blinkit setup: setting delivery pincode {pincode}", flush=True)
+        await _click_first_visible(page, _BLINKIT_LOCATION_TRIGGER_SELECTORS)
+        await asyncio.sleep(0.5)
+        filled = await _fill_first_visible(page, _BLINKIT_LOCATION_FIELD_SELECTORS, pincode, timeout=2_000)
+        if not filled:
+            await page.keyboard.type(pincode, delay=25)
+        await _select_blinkit_location_suggestion(page, pincode)
+        changed = True
+
+    body_text = await _blinkit_visible_text(page)
+    if any(marker in body_text for marker in _BLINKIT_LOCATION_MARKERS):
+        print("[opt] Blinkit setup: location prompt still visible; deferring product search", flush=True)
+        return changed
+
+    if product:
+        print(f"[opt] Blinkit setup: searching product {product!r}", flush=True)
+        clicked = await _click_first_visible(page, _BLINKIT_SEARCH_SELECTORS, timeout=2_000)
+        await asyncio.sleep(0.4)
+        filled = await _fill_first_visible(
+            page,
+            _BLINKIT_SEARCH_SELECTORS,
+            product,
+            timeout=1_000,
+            reject_placeholder_words=("location", "delivery"),
+        )
+        if not filled:
+            if not clicked:
+                await page.goto(
+                    f"https://blinkit.com/s/?q={product}",
+                    wait_until="domcontentloaded",
+                    timeout=30_000,
+                )
+                return True
+            await page.keyboard.type(product, delay=25)
+        await page.keyboard.press("Enter")
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=8_000)
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+        changed = True
+
+    return changed
+
+
 async def _execute_action(page, action: dict, snap: DomSnapshot | None) -> ActionOutcome:
     """Execute one action and report whether Playwright completed it cleanly."""
     kind = action.get("action", "wait")
@@ -319,6 +527,13 @@ async def _execute_action(page, action: dict, snap: DomSnapshot | None) -> Actio
         elif kind == "type":
             n = int(action.get("n", 0))
             text = str(action.get("text", ""))
+            if _is_blinkit_location_prompt(snap):
+                if text != _BLINKIT_PINCODE:
+                    print(
+                        f"[opt] overriding Blinkit location text {text!r} -> {_BLINKIT_PINCODE}",
+                        flush=True,
+                    )
+                text = _BLINKIT_PINCODE
             value = ""
             selector = ""
             if snap and 1 <= n <= len(snap.elements):
@@ -333,6 +548,8 @@ async def _execute_action(page, action: dict, snap: DomSnapshot | None) -> Actio
                     )
                 except Exception:
                     value = ""
+            if text == _BLINKIT_PINCODE and _is_blinkit_location_prompt(snap):
+                await _select_blinkit_location_suggestion(page, _BLINKIT_PINCODE)
             return ActionOutcome(
                 target_selector=selector,
                 input_value=value,
@@ -484,16 +701,83 @@ async def _speculate(router: ModelRouter, conversation: list[dict],
 
 # ── main agent ────────────────────────────────────────────────────────────────
 
+class _MockRouter:
+    def __init__(self) -> None:
+        self.stats = CascadeStats()
+
+
+class SarvamActionRouter:
+    def __init__(self) -> None:
+        self.stats = CascadeStats()
+        self.client = SarvamClient()
+
+    async def call(
+        self,
+        *,
+        decision: RouteDecision,
+        system: str,
+        messages: list[dict],
+        max_tokens: int | None = None,
+    ):
+        user_parts: list[str] = []
+        for message in messages:
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    str(part.get("text", ""))
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            user_parts.append(f"{message.get('role', 'user')}: {content}")
+        return await self.client.chat(
+            system=system,
+            user="\n\n".join(user_parts),
+            max_tokens=max_tokens if max_tokens is not None else decision.max_tokens,
+            temperature=0.0,
+        )
+
+    async def speculate(self, *, system: str, messages: list[dict]):
+        return await self.call(
+            decision=RouteDecision(
+                tier=TIER_DEEPSEEK,
+                model_label="sarvam",
+                or_model="sarvam",
+                reason="sarvam_speculation",
+                needs_vision=False,
+                max_tokens=256,
+                json_mode=True,
+            ),
+            system=system,
+            messages=messages,
+            max_tokens=256,
+        )
+
+    async def chat(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int = 500,
+        temperature: float = 0.1,
+    ):
+        return await self.client.chat(
+            system=system,
+            user=user,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+
 class OptimizedAgent:
     name = "optimized"
 
-    def __init__(self, meter: RunMeter, flags: Flags | None = None) -> None:
+    def __init__(self, meter: RunMeter, flags: Flags | None = None, router: Any | None = None) -> None:
         self.meter  = meter
         self.flags  = flags or Flags()
-        self.router = ModelRouter()
+        self.router = router if router is not None else (_MockRouter() if self.flags.mock else ModelRouter())
         self.allowed_domain = ""
 
-    async def run(self, task: NTESTask) -> AgentResult:
+    async def run(self, task: Any) -> AgentResult:
         from playwright.async_api import async_playwright
 
         _AGENT_DL.mkdir(parents=True, exist_ok=True)
@@ -523,9 +807,9 @@ class OptimizedAgent:
 
         goal_prefix = (
             f"Goal: {task.objective}\n"
-            f"Train number: {task.train_number}"
+            f"Website: {task.start_url}"
         )
-        system_prompt = _SYSTEM.replace("22691", task.train_number)
+        system_prompt = _SYSTEM
 
         task_allows_speculation = getattr(task, "speculation_enabled", True)
         if flags.speculation and not task_allows_speculation:
@@ -585,6 +869,26 @@ class OptimizedAgent:
             try:
                 await page.goto(task.start_url, wait_until="domcontentloaded", timeout=30_000)
                 self.allowed_domain = _registered_domain(urlparse(page.url).hostname or "")
+                if await _prepare_blinkit_for_product_search(page, task):
+                    route_log.append({
+                        "step": 0,
+                        "tier": -1,
+                        "model": "deterministic_blinkit_setup",
+                        "reason": "set_location_and_search_product",
+                        "escalated": False,
+                        "trigger": "preflight",
+                        "raw_value": "blinkit_preflight",
+                        "action": "set_location_then_search",
+                        "confidence": 1.0,
+                        "uncertain": False,
+                        "cache_hit": False,
+                        "playwright_ok": True,
+                        "page_changed": True,
+                        "action_success": True,
+                        "success_detail": "location_pincode_and_product_search_attempted",
+                        "consecutive_failures_after": consecutive_failures,
+                        "consecutive_uncertain_after": consecutive_uncertain,
+                    })
 
                 while step < MAX_STEPS:
                     step += 1
@@ -925,8 +1229,22 @@ class OptimizedAgent:
                     )
                 )
             finally:
-                await context.close()
-                await browser.close()
+                keep_open_for_manual_close = task.config_name == "full_optimized" and not launch_headless
+                if keep_open_for_manual_close:
+                    print(
+                        "[playwright] run finished; leaving browser open until you close it manually",
+                        flush=True,
+                    )
+                    while browser.is_connected():
+                        try:
+                            if not context.pages or all(p.is_closed() for p in context.pages):
+                                break
+                        except Exception:
+                            break
+                        await asyncio.sleep(1)
+                if browser.is_connected():
+                    await context.close()
+                    await browser.close()
 
         elapsed = time.perf_counter() - started
         spec_summary = f"{spec_hits}/{spec_attempts} hits" if spec_attempts else "n/a"
@@ -949,6 +1267,11 @@ class OptimizedAgent:
             print(f"  [failure] full_optimized final_step={final_step_desc}", flush=True)
             print(f"  [failure-dom] {' '.join(final_page_text.split())[:1000]}", flush=True)
 
+        extracted_answer = (
+            task.extract_answer(final_page_text)
+            if hasattr(task, "extract_answer")
+            else extract_status_string(final_page_text)
+        )
         await self.meter.publish(
             MeterEvent(
                 run_id=self.meter.run_id,
@@ -970,6 +1293,8 @@ class OptimizedAgent:
                         "cascade":       flags.cascade,
                         "speculation":   flags.speculation,
                     },
+                    "extracted_answer": extracted_answer,
+                    "task_type": getattr(task, "name", "unknown"),
                 }),
             )
         )
@@ -983,5 +1308,5 @@ class OptimizedAgent:
             total_output_tokens=total_out,
             total_cost_inr=round(total_cost, 4),
             steps=step,
-            extracted_status_string=extract_status_string(final_page_text),
+            extracted_status_string=extracted_answer,
         )

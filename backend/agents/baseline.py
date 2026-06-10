@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from backend.instrumentation.meter import BudgetExceededError, MeterEvent, RunMeter
 from backend.models.openrouter import DEFAULT_MODEL as _BASELINE_OR_MODEL, OpenRouterClient
 from backend.tasks.ntes import DOWNLOADS_DIR, NTESTask, extract_status_string
+from typing import Any
 
 # Each agent saves to its own sub-directory so concurrent runs don't
 # cross-contaminate success checks.
@@ -31,49 +32,40 @@ NAIVE_MAX_STEPS = 25
 COMPETENT_MAX_STEPS = 12
 
 NAIVE_SYSTEM_PROMPT = """\
-You are a web browser automation agent. Navigate the NTES live train running \
-status website for train 22691.
+You are a web browser automation agent. Complete the task described by the user.
 
 You will receive a 1920x1080 screenshot. Output ONE JSON action on the final line.
 
 Action format:
   {"action":"click",  "x":760, "y":340,   "thought":"...", "confidence":0.9}
-  {"action":"type",   "text":"22691",      "thought":"...", "confidence":0.9}
+  {"action":"type",   "text":"...",        "thought":"...", "confidence":0.9}
   {"action":"press",  "key":"Enter",       "thought":"...", "confidence":0.95}
   {"action":"scroll", "direction":"down",  "thought":"...", "confidence":0.7}
   {"action":"goto",   "url":"https://...", "thought":"...", "confidence":0.8}
   {"action":"wait",                        "thought":"...", "confidence":0.6}
 
-Find the train status using the screenshot and choose the next browser action.
+Analyse the screenshot and choose the next browser action to complete the task.
 """
 
 COMPETENT_SYSTEM_PROMPT = """\
-You are a web browser automation agent. Your sole job is to navigate the NTES \
-live train running status website and answer the user's train status goal.
+You are a web browser automation agent. Your sole job is to complete the task \
+described by the user using the browser.
 
 You will receive a 1920×1080 screenshot. Output ONE JSON action on the final line.
 
 Action format (x and y are PLAIN integers — never use a list):
   {"action":"click",  "x":760, "y":340,   "thought":"...", "confidence":0.9}
-  {"action":"type",   "text":"22691",      "thought":"...", "confidence":0.9}
+  {"action":"type",   "text":"...",        "thought":"...", "confidence":0.9}
   {"action":"press",  "key":"Enter",       "thought":"...", "confidence":0.95}
   {"action":"scroll", "direction":"down",  "thought":"...", "confidence":0.7}
   {"action":"goto",   "url":"https://...", "thought":"...", "confidence":0.8}
   {"action":"wait",                        "thought":"...", "confidence":0.6}
   {"action":"done",                        "thought":"...", "confidence":1.0}
-  {"action":"done", "extracted_answer":"<one sentence describing current station and delay>"}
+  {"action":"done", "extracted_answer":"<one sentence answer to the task>"}
 
-Navigation path:
-  1. Start from the NTES live train status page.
-  2. Find the train search field, type train number 22691, and submit.
-  3. Open the live running status result for train 22691.
-  4. Read the current station and delay or on-time status.
-  5. Signal "done" only after the visible page contains the requested answer.
-
-Termination: The task is complete when the page shows the train's current \
-location AND on-time/delay status. As soon as you see this information on \
-screen, output:
-{"action": "done", "extracted_answer": "<one sentence describing current station and delay>"}
+Navigate to the task website, complete the task, and signal "done" as soon as \
+the answer is visible on screen.
+{"action": "done", "extracted_answer": "<one sentence answer>"}
 Do not continue clicking after the answer is visible.
 """
 
@@ -112,7 +104,7 @@ class BaselineAgent:
         if not mock:
             self._openrouter = OpenRouterClient()
 
-    async def run(self, task: NTESTask) -> AgentResult:
+    async def run(self, task: Any) -> AgentResult:
         from playwright.async_api import async_playwright
 
         _AGENT_DL.mkdir(parents=True, exist_ok=True)
@@ -156,13 +148,11 @@ class BaselineAgent:
 
                 goal_prefix = (
                     f"Goal: {task.objective}\n"
-                    f"Train number: {task.train_number}\n"
+                    f"Website: {task.start_url}\n"
                 )
 
                 max_steps = COMPETENT_MAX_STEPS if self.mode == "competent" else NAIVE_MAX_STEPS
-                prompt = (
-                    COMPETENT_SYSTEM_PROMPT if self.mode == "competent" else NAIVE_SYSTEM_PROMPT
-                ).replace("22691", task.train_number)
+                prompt = COMPETENT_SYSTEM_PROMPT if self.mode == "competent" else NAIVE_SYSTEM_PROMPT
                 recent_signatures: list[str] = []
 
                 while step < max_steps:
@@ -320,6 +310,11 @@ class BaselineAgent:
                 current_model=MODEL_LABEL,
             )
         )
+        extracted_answer = (
+            task.extract_answer(final_page_text)
+            if hasattr(task, "extract_answer")
+            else extract_status_string(final_page_text)
+        )
         return AgentResult(
             agent=self.name,
             success=success,
@@ -329,7 +324,7 @@ class BaselineAgent:
             total_output_tokens=total_out,
             total_cost_inr=round(total_cost, 4),
             steps=step,
-            extracted_status_string=extract_status_string(final_page_text),
+            extracted_status_string=extracted_answer,
         )
 
 
