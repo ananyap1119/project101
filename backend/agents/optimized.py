@@ -184,6 +184,16 @@ _BLINKIT_LOCATION_TRIGGER_SELECTORS = (
     'div:has-text("Select Location")',
     '[data-testid*="location"]',
 )
+
+_NTES_TRAIN_FIELD_SELECTORS = (
+    'input[placeholder*="train" i]',
+    'input[aria-label*="train" i]',
+    'input[name*="train" i]',
+    'input[id*="train" i]',
+    'input[type="search"]',
+    'input[type="text"]',
+    'input',
+)
 _BLINKIT_LOCATION_SUGGESTION_SELECTORS = (
     '[role="option"]',
     '[data-testid*="suggestion"]',
@@ -496,6 +506,59 @@ async def _prepare_blinkit_for_product_search(page, task: Any) -> bool:
         changed = True
 
     return changed
+
+
+async def _page_has_input_value(page, value: str) -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """wanted => Array.from(document.querySelectorAll('input, textarea'))
+                    .some(el => String(el.value || '').trim().includes(wanted))""",
+                value,
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _prepare_ntes_train_status(page, task: Any) -> bool:
+    """Best-effort deterministic NTES setup: enter train number and submit."""
+    if getattr(task, "name", "") != "ntes" or "indianrail.gov.in" not in page.url.lower():
+        return False
+
+    train_number = re.sub(r"\D", "", str(getattr(task, "train_number", "") or ""))
+    if not (4 <= len(train_number) <= 5):
+        return False
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=8_000)
+    except Exception:
+        pass
+
+    if await _page_has_input_value(page, train_number):
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(2)
+        return True
+
+    for selector in _NTES_TRAIN_FIELD_SELECTORS:
+        try:
+            loc = page.locator(selector).first
+            if await loc.count() and await loc.is_visible(timeout=1_500):
+                await loc.click(timeout=2_000)
+                await loc.fill(train_number, timeout=2_000)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(2)
+                return True
+        except Exception:
+            continue
+
+    try:
+        await page.keyboard.type(train_number, delay=25)
+        await page.keyboard.press("Enter")
+        await asyncio.sleep(2)
+        return True
+    except Exception:
+        return False
 
 
 async def _execute_action(page, action: dict, snap: DomSnapshot | None) -> ActionOutcome:
@@ -867,6 +930,7 @@ class OptimizedAgent:
             context.on("page", _on_popup)
 
             try:
+                print(f"[opt] opening start_url={task.start_url}", flush=True)
                 await page.goto(task.start_url, wait_until="domcontentloaded", timeout=30_000)
                 self.allowed_domain = _registered_domain(urlparse(page.url).hostname or "")
                 if await _prepare_blinkit_for_product_search(page, task):
@@ -886,6 +950,26 @@ class OptimizedAgent:
                         "page_changed": True,
                         "action_success": True,
                         "success_detail": "location_pincode_and_product_search_attempted",
+                        "consecutive_failures_after": consecutive_failures,
+                        "consecutive_uncertain_after": consecutive_uncertain,
+                    })
+                if await _prepare_ntes_train_status(page, task):
+                    route_log.append({
+                        "step": 0,
+                        "tier": -1,
+                        "model": "deterministic_ntes_setup",
+                        "reason": "enter_train_number_and_submit",
+                        "escalated": False,
+                        "trigger": "preflight",
+                        "raw_value": "ntes_preflight",
+                        "action": "type_train_number_then_enter",
+                        "confidence": 1.0,
+                        "uncertain": False,
+                        "cache_hit": False,
+                        "playwright_ok": True,
+                        "page_changed": True,
+                        "action_success": True,
+                        "success_detail": f"submitted_train_number={task.train_number}",
                         "consecutive_failures_after": consecutive_failures,
                         "consecutive_uncertain_after": consecutive_uncertain,
                     })
@@ -1113,6 +1197,28 @@ class OptimizedAgent:
                         break
 
                     # ── Layer 4: speculative execution ────────────────────────
+                    if getattr(task, "name", "") == "ntes" and action.get("action") == "type":
+                        intended_train_number = re.sub(r"\D", "", str(getattr(task, "train_number", "") or ""))
+                        typed_digits = re.sub(r"\D", "", str(action.get("text", "") or ""))
+                        if intended_train_number and typed_digits != intended_train_number:
+                            print(
+                                f"  [opt-ntes] overriding typed train number "
+                                f"{typed_digits!r} -> {intended_train_number!r}",
+                                flush=True,
+                            )
+                            action["text"] = intended_train_number
+                        if intended_train_number and await _page_has_input_value(page, intended_train_number):
+                            print(
+                                "  [opt-ntes] train number already entered; pressing Enter",
+                                flush=True,
+                            )
+                            action = {
+                                "action": "press",
+                                "key": "Enter",
+                                "thought": "train number already entered; submit query",
+                                "confidence": 0.95,
+                            }
+
                     if (
                         flags.speculation
                         and task_allows_speculation

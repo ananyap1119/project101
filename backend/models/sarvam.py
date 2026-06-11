@@ -45,6 +45,56 @@ def _dedup_reply(text: str) -> str:
     return " ".join(seen) if seen else text[:120]
 
 
+_TRAIN_NUMBER_WORDS = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "won": "1",
+    "two": "2", "too": "2", "to": "2",
+    "three": "3", "tree": "3",
+    "four": "4", "for": "4",
+    "five": "5",
+    "six": "6", "sex": "6",
+    "seven": "7",
+    "eight": "8", "ate": "8",
+    "nine": "9",
+    "twenty": "2", "thirty": "3", "forty": "4", "fifty": "5",
+    "sixty": "6", "seventy": "7", "eighty": "8", "ninety": "9",
+    "baais": "22", "bais": "22", "teis": "23", "chaubees": "24",
+    "pachis": "25", "chabbis": "26", "sattais": "27", "athais": "28",
+    "untees": "29",
+    "shunya": "0", "sunya": "0", "ek": "1", "do": "2", "teen": "3",
+    "char": "4", "chaar": "4", "panch": "5", "paanch": "5", "che": "6",
+    "chhe": "6", "chhah": "6", "saat": "7", "aath": "8", "nau": "9",
+}
+
+
+def _train_number_from_transcript(transcript: str) -> str | None:
+    """Extract a 4-5 digit train number without an LLM when possible."""
+    digit_match = re.search(r"\b\d(?:[\s-]*\d){3,4}\b", transcript)
+    if digit_match:
+        digits = re.sub(r"\D", "", digit_match.group(0))
+        if 4 <= len(digits) <= 5:
+            return digits
+
+    tokens = re.findall(r"[a-zA-Z]+", transcript.lower())
+    digit_runs: list[str] = []
+    current = ""
+    for token in tokens:
+        digit = _TRAIN_NUMBER_WORDS.get(token)
+        if digit is None:
+            if current:
+                digit_runs.append(current)
+                current = ""
+            continue
+        current += digit
+    if current:
+        digit_runs.append(current)
+
+    for digits in digit_runs:
+        if 4 <= len(digits) <= 5:
+            return digits
+    return None
+
+
 def _build_multipart(fields: dict[str, str], file_name: str, file_bytes: bytes, file_mime: str) -> tuple[bytes, str]:
     """Build a multipart/form-data body as pure bytes — avoids httpx charmap issues on Windows."""
     boundary = uuid.uuid4().hex.encode()
@@ -572,8 +622,11 @@ Rules:
             text = "\n".join(text.split("\n")[1:]).rstrip("`").strip()
 
         # Try full JSON parse first.
+        fallback_train_number = _train_number_from_transcript(transcript)
         try:
             result = _json.loads(text)
+            if fallback_train_number:
+                result["train_number"] = fallback_train_number
             print(f"  [intent_ntes] {result}", flush=True)
             return result
         except _json.JSONDecodeError:
@@ -584,6 +637,8 @@ Rules:
             try:
                 result = _json.loads(candidate)
                 if "task" in result:
+                    if fallback_train_number:
+                        result["train_number"] = fallback_train_number
                     print(f"  [intent_ntes] rescued {result}", flush=True)
                     return result
             except _json.JSONDecodeError:
@@ -597,11 +652,21 @@ Rules:
         if task_m:
             result = {
                 "task":           task_m.group(1),
-                "train_number":   num_m.group(1) if num_m else None,
+                "train_number":   fallback_train_number or (num_m.group(1) if num_m else None),
                 "reply_language": lang_m.group(1) if lang_m else "hi-IN",
                 "confidence":     float(conf_m.group(1)) if conf_m else 0.7,
             }
             print(f"  [intent_ntes] regex-rescued {result}", flush=True)
+            return result
+
+        if fallback_train_number:
+            result = {
+                "task": "train_status",
+                "train_number": fallback_train_number,
+                "reply_language": "hi-IN",
+                "confidence": 0.8,
+            }
+            print(f"  [intent_ntes] transcript-fallback {result}", flush=True)
             return result
 
         print(f"  [intent_ntes] parse error: {raw[:200]!r}", flush=True)
