@@ -2,6 +2,7 @@ import json
 import unittest
 
 from backend.main import _build_task_from_intent
+from backend.agents.optimized import _blinkit_product_score
 from backend.models.sarvam import _language_from_script
 from backend.tasks.grocery import BlinkitPlannerTask, GroceryItem
 
@@ -71,6 +72,15 @@ class GroceryPlannerTests(unittest.TestCase):
         self.assertEqual(_language_from_script("ಒಂದು ವಾರಕ್ಕೆ ದಿನಸಿ"), "kn-IN")
         self.assertEqual(_language_from_script("एक हफ्ते का सामान"), "hi-IN")
         self.assertIsNone(_language_from_script("make pasta"))
+
+    def test_fresh_onion_ranks_above_onion_snacks(self) -> None:
+        fresh = _blinkit_product_score("Fresh Onion 1 kg ₹45 ADD", "Onion", "onion")
+        snack = _blinkit_product_score(
+            "Garden Onion Pakoda Namkeen / Chakli 140 g ₹49 ADD",
+            "Onion",
+            "onion",
+        )
+        self.assertGreater(fresh, snack)
 
 
 if __name__ == "__main__":

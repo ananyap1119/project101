@@ -508,6 +508,34 @@ async def _prepare_blinkit_for_product_search(page, task: Any) -> bool:
     return changed
 
 
+_FRESH_PRODUCE = {
+    "onion", "onions", "tomato", "tomatoes", "potato", "potatoes", "carrot", "carrots",
+    "coriander", "mint", "spinach", "capsicum", "cucumber", "ginger", "garlic",
+}
+_PRODUCE_MISMATCH_TERMS = {
+    "pakoda", "namkeen", "chips", "powder", "flakes", "seasoning", "masala", "pickle",
+    "sauce", "soup", "instant", "snack", "chakli",
+}
+
+
+def _blinkit_product_score(card_text: str, requested_name: str, query: str) -> int:
+    text = card_text.lower()
+    requested = requested_name.lower().strip()
+    terms = {
+        term for term in re.findall(r"[a-z0-9]+", f"{requested} {query.lower()}")
+        if len(term) > 2
+    }
+    score = sum(4 for term in terms if re.search(rf"\b{re.escape(term)}\b", text))
+    if requested and requested in text:
+        score += 10
+    requested_terms = set(re.findall(r"[a-z]+", requested))
+    if requested_terms & _FRESH_PRODUCE:
+        score += 4 if any(word in text for word in ("fresh", "vegetable", "local")) else 0
+        if any(term in text for term in _PRODUCE_MISMATCH_TERMS):
+            score -= 100
+    return score
+
+
 async def _build_blinkit_grocery_cart(page, task: Any) -> dict | None:
     """Search and add a bounded grocery plan. Never opens checkout."""
     if getattr(task, "name", "") != "blinkit_planner":
@@ -543,12 +571,15 @@ async def _build_blinkit_grocery_cart(page, task: Any) -> dict | None:
             cards = page.locator("div.tw-relative.tw-flex.tw-h-full.tw-flex-col")
             card_count = await cards.count()
             selected = None
+            selected_score = -10_000
             for index in range(min(card_count, 20)):
                 card = cards.nth(index)
                 text = " ".join((await card.inner_text()).split())
                 if "ADD" in text or re.search(r"\s\d+\s*$", text):
-                    selected = card
-                    break
+                    score = _blinkit_product_score(text, requested_name, query)
+                    if score > selected_score:
+                        selected = card
+                        selected_score = score
             if selected is None:
                 result["status"] = "unavailable"
                 entries.append(result)
