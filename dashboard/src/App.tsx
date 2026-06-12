@@ -22,6 +22,171 @@ type BenchmarkResult = {
   wall_seconds: number;
 };
 
+type TrainOption = {
+  number: string;
+  name: string;
+  days: string;
+  category: string;
+  departure_time: string;
+  departure_station: string;
+  arrival_time: string;
+  arrival_station: string;
+  duration: string;
+};
+
+type RailwayResult = {
+  origin: string;
+  destination: string;
+  travel_date: string;
+  total_found: number;
+  trains: TrainOption[];
+};
+
+type ShoppingEntry = {
+  platform: "amazon" | "flipkart";
+  title: string;
+  status: string;
+  price: string;
+  detail: string;
+};
+
+type ShoppingActivity = {
+  action: "orders" | "cart" | "wishlist" | "saved_items" | "buy_again" | "browsing_history" | "invoices";
+  entries: ShoppingEntry[];
+  platforms_checked: string[];
+  message: string;
+};
+
+const SHOPPING_LABELS: Record<ShoppingActivity["action"], string> = {
+  orders: "Recent orders",
+  cart: "Shopping cart",
+  wishlist: "Wishlist",
+  saved_items: "Saved items",
+  buy_again: "Buy again",
+  browsing_history: "Browsing history",
+  invoices: "Invoice availability",
+};
+
+function ResultPanel({ answer, taskType, structured }: {
+  answer: string;
+  taskType: string;
+  structured: unknown;
+}) {
+  if (taskType === "train_search" && structured) {
+    const result = structured as RailwayResult;
+    return (
+      <section className="min-w-0 overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900 p-4 sm:p-6">
+        <div className="flex flex-col gap-3 border-b border-zinc-800 pb-5 sm:flex-row sm:items-end sm:justify-between">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600">Train Options</p>
+            <h2 className="mt-2 break-words text-xl font-semibold text-zinc-100 sm:text-2xl">
+              {result.origin} <span className="text-zinc-600">to</span> {result.destination}
+            </h2>
+            <p className="mt-1 text-sm text-zinc-500">Travel date: {result.travel_date}</p>
+          </div>
+          <span className="w-fit rounded-full bg-violet-500/10 px-3 py-1 text-xs font-semibold text-violet-300">
+            {result.total_found} found
+          </span>
+        </div>
+
+        <div className="mt-5 grid min-w-0 gap-4 lg:grid-cols-2">
+          {result.trains.map((train) => (
+            <article key={train.number} className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+              <div className="flex min-w-0 items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="font-mono text-xs text-violet-400">{train.number}</p>
+                  <h3 className="mt-1 break-words text-sm font-semibold text-zinc-100">{train.name}</h3>
+                </div>
+                <span className="shrink-0 rounded-md bg-zinc-800 px-2 py-1 text-[11px] text-zinc-400">
+                  {train.duration}
+                </span>
+              </div>
+
+              <div className="mt-5 grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+                <div className="min-w-0">
+                  <p className="text-xl font-semibold text-zinc-100">{train.departure_time}</p>
+                  <p className="mt-1 break-words text-xs leading-5 text-zinc-500">{train.departure_station}</p>
+                </div>
+                <div className="h-px w-8 bg-zinc-700 sm:w-12" />
+                <div className="min-w-0 text-right">
+                  <p className="text-xl font-semibold text-zinc-100">{train.arrival_time}</p>
+                  <p className="mt-1 break-words text-xs leading-5 text-zinc-500">{train.arrival_station}</p>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap gap-2 text-[11px] text-zinc-400">
+                <span className="rounded-md bg-zinc-800 px-2 py-1">{train.days}</span>
+                <span className="rounded-md bg-zinc-800 px-2 py-1">{train.category}</span>
+              </div>
+            </article>
+          ))}
+        </div>
+      </section>
+    );
+  }
+
+  if (taskType === "shopping_orders" && structured) {
+    const result = structured as ShoppingActivity;
+    return (
+      <section className="min-w-0 overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900 p-4 sm:p-6">
+        <div className="flex flex-col gap-3 border-b border-zinc-800 pb-5 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600">Shopping Activity</p>
+            <h2 className="mt-2 text-xl font-semibold text-zinc-100">{SHOPPING_LABELS[result.action]}</h2>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {result.platforms_checked.map((platform) => (
+              <span key={platform} className="rounded-full bg-violet-500/10 px-3 py-1 text-xs font-semibold capitalize text-violet-300">
+                {platform}
+              </span>
+            ))}
+          </div>
+        </div>
+
+        {result.entries.length === 0 ? (
+          <div className="py-10 text-center">
+            <div className="mx-auto flex h-11 w-11 items-center justify-center rounded-full bg-zinc-800 text-lg text-zinc-400">
+              0
+            </div>
+            <p className="mt-4 text-base font-medium text-zinc-200">Nothing to show</p>
+            <p className="mx-auto mt-2 max-w-md text-sm leading-6 text-zinc-500">{result.message}</p>
+          </div>
+        ) : (
+          <div className="mt-5 grid gap-4 lg:grid-cols-2">
+            {result.entries.map((entry, index) => (
+              <article key={`${entry.platform}-${index}`} className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-xs font-semibold uppercase tracking-widest text-violet-400">{entry.platform}</p>
+                    <h3 className="mt-2 break-words text-sm font-semibold text-zinc-100">
+                      {entry.title || SHOPPING_LABELS[result.action]}
+                    </h3>
+                  </div>
+                  {(entry.status || entry.price) && (
+                    <span className="shrink-0 rounded-md bg-emerald-500/10 px-2 py-1 text-xs text-emerald-300">
+                      {entry.status || entry.price}
+                    </span>
+                  )}
+                </div>
+                {entry.detail && (
+                  <p className="mt-4 line-clamp-3 break-words text-xs leading-5 text-zinc-500">{entry.detail}</p>
+                )}
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    );
+  }
+
+  return (
+    <section className="min-w-0 overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900 p-4 sm:p-6">
+      <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600">Result</p>
+      <p className="mt-3 whitespace-pre-wrap break-words text-sm leading-6 text-zinc-200">{answer}</p>
+    </section>
+  );
+}
+
 // ── Minimal agent row (voice tab sidebar) ─────────────────────────────────────
 function AgentRow({ label, snapshot }: { label: string; snapshot: AgentSnapshot }) {
   const dot =
@@ -207,6 +372,8 @@ export default function App() {
   const [isPlayingReply, setIsPlayingReply] = useState(false);
   const [snapshots, setSnapshots]           = useState<Snapshots>({ baseline: emptySnapshot, optimized: emptySnapshot });
   const [benchmarkResults, setBenchmarkResults] = useState<BenchmarkResult[]>([]);
+  const [latestAnswer, setLatestAnswer]         = useState("");
+  const [latestStructured, setLatestStructured] = useState<unknown>(null);
 
   useEffect(() => {
     const id = window.setInterval(async () => {
@@ -246,6 +413,8 @@ export default function App() {
     replyCalledRef.current = new Set();
     sourceRef.current?.close();
     setIsRunning(true);
+    setLatestAnswer("");
+    setLatestStructured(null);
     setSnapshots({ baseline: emptySnapshot, optimized: { ...emptySnapshot, status: "running", currentStep: "queued" } });
     sourceRef.current = connectRunStream(rid, applyMeterEvent, () => setIsRunning(false));
   }
@@ -265,16 +434,26 @@ export default function App() {
     if (event.agent === "optimized" && event.event === "agent_complete" && voiceMetaRef.current && !replyCalledRef.current.has(event.run_id)) {
       replyCalledRef.current.add(event.run_id);
       const meta = voiceMetaRef.current;
-      const success = !event.current_step.includes("max_steps") && !event.current_step.includes("budget") && !event.current_step.includes("error");
       let extracted = "";
-      try { extracted = JSON.parse(event.detail ?? "{}").extracted_answer ?? ""; } catch {}
+      let success = !event.current_step.includes("max_steps") && !event.current_step.includes("budget") && !event.current_step.includes("error");
+      try {
+        const detail = JSON.parse(event.detail ?? "{}") as {
+          extracted_answer?: string;
+          structured_result?: unknown;
+          success?: boolean;
+        };
+        extracted = detail.extracted_answer ?? "";
+        setLatestStructured(detail.structured_result ?? null);
+        if (typeof detail.success === "boolean") success = detail.success;
+      } catch {}
+      setLatestAnswer(extracted);
       void triggerVoiceReply(event.run_id, success, meta.replyLang, meta.taskType, extracted, meta.transcript);
     }
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-50">
-      <div className="mx-auto max-w-6xl px-6 py-10 xl:py-14">
+    <div className="min-h-screen overflow-x-hidden bg-zinc-950 text-zinc-50">
+      <div className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8 xl:py-12">
 
         {/* Header */}
         <div className="mb-10 flex items-center justify-between">
@@ -309,8 +488,17 @@ export default function App() {
 
         {/* Voice tab */}
         {tab === "voice" && (
-          <div className="grid grid-cols-1 gap-16 xl:grid-cols-[1fr_360px]">
-            <VoiceBar disabled={isRunning} onRunStarted={handleVoiceRunStarted} />
+          <div className="grid min-w-0 grid-cols-1 gap-10 xl:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="min-w-0 space-y-8">
+              <VoiceBar disabled={isRunning} onRunStarted={handleVoiceRunStarted} />
+              {latestAnswer && (
+                <ResultPanel
+                  answer={latestAnswer}
+                  taskType={voiceMetaRef.current?.taskType ?? "unknown"}
+                  structured={latestStructured}
+                />
+              )}
+            </div>
             <div>
               <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600 mb-6">Live Agent</p>
               <AgentRow label="Optimised · DeepSeek cascade" snapshot={snapshots.optimized} />

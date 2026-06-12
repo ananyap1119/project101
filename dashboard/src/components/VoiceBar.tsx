@@ -7,6 +7,11 @@ export type IntentResult = {
   intent: {
     task: string;
     train_number: string | null;
+    origin?: string | null;
+    destination?: string | null;
+    travel_date?: string | null;
+    platform?: "amazon" | "flipkart" | "all" | null;
+    shopping_action?: "orders" | "cart" | "wishlist" | "saved_items" | "buy_again" | "browsing_history" | "invoices" | null;
     city: string | null;
     product: string | null;
     team: string | null;
@@ -18,6 +23,8 @@ export type IntentResult = {
 };
 
 const TASK_META: Record<string, { icon: string; label: string }> = {
+  train_search: { icon: "TR", label: "Train Journey" },
+  shopping_orders: { icon: "SH", label: "Shopping Activity" },
   train_status: { icon: "🚂", label: "Train Status" },
   cricket:      { icon: "🏏", label: "Cricket" },
   weather:      { icon: "🌤", label: "Weather" },
@@ -247,7 +254,7 @@ export function VoiceBar({ disabled, onRunStarted }: Props) {
       {/* Transcript + result */}
       {result && (
         <div className="space-y-4">
-          <p className="text-3xl font-light text-zinc-200 leading-snug">
+          <p className="break-words text-2xl font-light leading-snug text-zinc-200 sm:text-3xl">
             "{result.transcript}"
           </p>
           <div className="flex flex-wrap items-center gap-3">

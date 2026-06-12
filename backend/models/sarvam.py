@@ -14,6 +14,7 @@ import time
 import uuid
 import warnings
 from dataclasses import dataclass
+from datetime import date
 
 import httpx
 import urllib3
@@ -147,9 +148,9 @@ SARVAM_MODEL = _chat_model_name()
 
 # Known-good Bulbul speaker IDs per language.  Female voices first.
 _BULBUL_SPEAKERS: dict[str, list[str]] = {
-    "hi-IN": ["diya", "anushka", "arvind", "amol"],
-    "en-IN": ["meera", "anushka", "arvind"],
-    "kn-IN": ["anushka", "arvind"],
+    "hi-IN": ["anushka", "abhilash"],
+    "en-IN": ["anushka", "abhilash"],
+    "kn-IN": ["anushka", "abhilash"],
     "ta-IN": ["anushka"],
     "te-IN": ["anushka"],
     "ml-IN": ["anushka"],
@@ -219,6 +220,7 @@ class SarvamClient:
         user: str,
         max_tokens: int = 512,
         temperature: float = 0.2,
+        json_mode: bool = True,
     ) -> ModelResponse:
         if not self._live:
             return self._stub_chat(user)
@@ -233,8 +235,9 @@ class SarvamClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
             "reasoning_effort": None,
-            "response_format": {"type": "json_object"},   # suppress think blocks
         }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
         r = await self._http.post("/chat/completions", content=_json_bytes(payload), headers=_JSON_CT)
         if r.status_code == 400 and "response_format" in r.text:
             payload.pop("response_format", None)
@@ -391,7 +394,7 @@ class SarvamClient:
         text: str,
         language_code: str = "hi-IN",
         speaker: str = "",   # empty = use first (female) speaker for the language
-        pace: float = 1.0,
+        pace: float = 0.92,
     ) -> bytes:
         """Synthesise speech via Bulbul v2.  Returns raw WAV bytes."""
         if not self._live:
@@ -438,6 +441,8 @@ class SarvamClient:
         system = """\
 You are a voice command parser for an Indian AI assistant that handles:
   - Train live running status (NTES)
+  - Train discovery between an origin and destination, with destination weather
+  - Read-only Amazon and Flipkart shopping activity
   - Cricket match scores (Cricbuzz)
   - Weather lookup (wttr.in)
   - Grocery prices on Blinkit
@@ -445,10 +450,17 @@ You are a voice command parser for an Indian AI assistant that handles:
 The transcript may be in Hindi, English, Kannada, Telugu, Tamil, Malayalam, or code-mixed.
 Return ONLY valid JSON — no markdown, no prose, no <think> tags:
 {
-  "task": "train_status" | "cricket" | "weather" | "blinkit" | "unknown",
+  "task": "train_status" | "train_search" | "shopping_orders" | "cricket" | "weather" | "blinkit" | "unknown",
   "reply_language": "hi-IN" | "en-IN" | "kn-IN" | "te-IN" | "ta-IN" | "ml-IN",
   "confidence": 0.0–1.0,
   "train_number": "NNNNN" or null,
+  "origin": "origin city or station in English" or null,
+  "destination": "destination city or station in English" or null,
+  "travel_date": "YYYY-MM-DD" or null,
+  "travel_preferences": "timing/class/duration preferences in English" or null,
+  "platform": "amazon" | "flipkart" | "all" or null,
+  "shopping_action": "orders" | "cart" | "wishlist" | "saved_items" | "buy_again" | "browsing_history" | "invoices" or null,
+  "shopping_query": "the complete requested read-only shopping action in English" or null,
   "city": "city name" or null,
   "weather_question": "specific weather aspect asked" or null,
   "product": "product name" or null,
@@ -456,6 +468,16 @@ Return ONLY valid JSON — no markdown, no prose, no <think> tags:
 }
 
 Rules:
+- train_search: asks to travel/go from one place to another by train or asks for train options.
+  Extract origin, destination, and resolve relative dates such as today/tomorrow to YYYY-MM-DD.
+  A phrase like "I am from Bangalore and want a train to Chennai tomorrow" means origin Bangalore,
+  destination Chennai, task train_search.
+- shopping_orders: any read-only Amazon/Flipkart account or shopping request. Set shopping_action:
+  cart for cart/basket, wishlist for wish list, saved_items for saved-for-later, buy_again for repeat
+  purchases, browsing_history for recently viewed/history, invoices for invoice/bill availability,
+  and orders for order history/tracking/delivery. Set platform to the named site, or "all" when both
+  are explicitly requested. Never reinterpret cart, wishlist, or history as orders.
+  Returns, cancellations, checkout, quantity changes, and other write actions are unsupported.
 - train_status: mentions of train/rail/railu/gaadi/train numbers, "kahan hai", "late", "running status",
   "ಯಾವ station", "எங்கே", spoken numbers ("baais chhe nau ek" = 22691)
 - cricket: "cricket", "match", "score", "IPL", "test", "wicket", "run", team/player names,
@@ -477,7 +499,11 @@ Rules:
   Telugu → "te-IN", Tamil → "ta-IN", Malayalam → "ml-IN", else "en-IN"
 - confidence = 1.0 if task + params are clear, 0.7 if task clear but params inferred, 0.3 if uncertain"""
 
-        resp = await self.chat(system=system, user=f"Transcript: {transcript}", max_tokens=512)
+        resp = await self.chat(
+            system=system,
+            user=f"Current date: {date.today().isoformat()}\nTranscript: {transcript}",
+            max_tokens=768,
+        )
         raw = resp.text.strip()
         import re as _re, json as _json
 
@@ -512,6 +538,13 @@ Rules:
                 "reply_language": lang_m.group(1) if lang_m else "hi-IN",
                 "confidence":     float(conf_m.group(1)) if conf_m else 0.5,
                 "train_number":     None,
+                "origin":           None,
+                "destination":      None,
+                "travel_date":      None,
+                "travel_preferences": None,
+                "platform":         None,
+                "shopping_action":  None,
+                "shopping_query":   None,
                 "city":             None,
                 "weather_question": None,
                 "product":          None,
@@ -520,7 +553,10 @@ Rules:
 
         print(f"  [intent] parse error: {raw[:200]!r}", flush=True)
         return {"task": "unknown", "reply_language": "hi-IN", "confidence": 0.0,
-                "train_number": None, "city": None, "product": None, "cricket_query": None}
+                "train_number": None, "origin": None, "destination": None,
+                "travel_date": None, "platform": None, "shopping_action": None,
+                "shopping_query": None,
+                "city": None, "product": None, "cricket_query": None}
 
     async def generate_voice_reply(
         self,
@@ -531,7 +567,7 @@ Rules:
         user_question: str = "",
     ) -> str:
         """Use Sarvam-M to directly answer the user's question in their language."""
-        if not self._live:
+        if not self._live and task_type != "train_search":
             return self._stub_reply(task_type, reply_language, success)
 
         if not success or not result_snippet.strip():
@@ -543,26 +579,114 @@ Rules:
                 "ml-IN": "Pravshanam nadannilla. Daya vech veeendum shramikkuka.",
             }.get(reply_language, "Sorry, could not complete the task. Please try again.")
 
+        if task_type == "train_search":
+            count_match = re.search(r"^(\d+) trains found", result_snippet, re.I)
+            option_pattern = re.compile(
+                r"^(\d{5})\s+(.+?):\s+(\d{2}:\d{2})\s+from\s+.+?,\s+"
+                r"arrives\s+(\d{2}:\d{2})\s+at\s+.+?,\s+duration\s+(\d{2}:\d{2})",
+                re.I | re.M,
+            )
+            options = option_pattern.findall(result_snippet)[:3]
+            if options:
+                count = count_match.group(1) if count_match else str(len(options))
+                if reply_language == "kn-IN":
+                    intro = f"ಒಟ್ಟು {count} ರೈಲುಗಳು ಸಿಕ್ಕಿವೆ."
+                    details = [
+                        f"{number} {name} ರೈಲು {departure} ಗಂಟೆಗೆ ಹೊರಟು {arrival} ಗಂಟೆಗೆ "
+                        f"ತಲುಪುತ್ತದೆ, ಪ್ರಯಾಣ ಸಮಯ {duration}."
+                        for number, name, departure, arrival, duration in options
+                    ]
+                elif reply_language == "hi-IN":
+                    intro = f"कुल {count} ट्रेनें मिली हैं।"
+                    details = [
+                        f"{number} {name} ट्रेन {departure} बजे चलकर {arrival} बजे पहुंचती है, "
+                        f"यात्रा समय {duration} है।"
+                        for number, name, departure, arrival, duration in options
+                    ]
+                else:
+                    intro = f"I found {count} trains."
+                    details = [
+                        f"{number} {name} departs at {departure}, arrives at {arrival}, and takes {duration}."
+                        for number, name, departure, arrival, duration in options
+                    ]
+                text = " ".join([intro, *details])
+                safe_log = text.encode("ascii", errors="backslashreplace").decode("ascii")
+                print(f"  [voice_reply] {safe_log!r}", flush=True)
+                return text
+
         system = (
-            f"You are a voice assistant. Reply in {reply_language}. "
-            "Write EXACTLY ONE sentence — no more. "
-            "For yes/no questions start with haan/nahi (Hindi), haudu/illa (Kannada), or yes/no. "
-            "Never repeat yourself. Never restate the question."
+            f"You are a clear Indian voice assistant. Reply only in {reply_language}, using its "
+            "native script rather than romanization. Give a complete but concise spoken answer in "
+            "2 to 4 sentences. For train searches, mention the total count and the first three train "
+            "options, including train number, name, departure time, arrival time, and duration. "
+            "Preserve every number and time exactly. Do not output JSON, markdown, labels, or bullet "
+            "characters. Never repeat the question."
         )
         question_part = f'Question: "{user_question}"\n' if user_question else ""
         # Keep snippet short — large input causes repetition loops
-        snippet = result_snippet[:250]
+        snippet = result_snippet[:1600]
         try:
             resp = await self.chat(
                 system=system,
                 user=f"{question_part}Facts: {snippet}",
-                max_tokens=45,
+                max_tokens=320,
                 temperature=0.0,
+                json_mode=False,
             )
-            text = _dedup_reply(resp.text.strip())
-            text = re.split(r"(?<=[।.!?])\s+", text, maxsplit=1)[0].strip()
+            raw_reply = re.sub(r"<think>.*?</think>", "", resp.text, flags=re.DOTALL).strip()
+            try:
+                parsed_reply = _json_mod.loads(raw_reply)
+                if isinstance(parsed_reply, dict):
+                    trains = parsed_reply.get("trains")
+                    if task_type == "train_search" and isinstance(trains, list) and trains:
+                        total = parsed_reply.get("total_count") or parsed_reply.get("total_found") or len(trains)
+                        phrases: list[str] = []
+                        for train in trains[:3]:
+                            if not isinstance(train, dict):
+                                continue
+                            number = train.get("number", "")
+                            name = train.get("name", "")
+                            departure = train.get("departure_time", "")
+                            arrival = train.get("arrival_time", "")
+                            duration = train.get("duration", "")
+                            if reply_language == "kn-IN":
+                                phrases.append(
+                                    f"{number} {name} ರೈಲು {departure} ಗಂಟೆಗೆ ಹೊರಟು {arrival} ಗಂಟೆಗೆ "
+                                    f"ತಲುಪುತ್ತದೆ, ಪ್ರಯಾಣ ಸಮಯ {duration}"
+                                )
+                            elif reply_language == "hi-IN":
+                                phrases.append(
+                                    f"{number} {name} ट्रेन {departure} बजे चलकर {arrival} बजे पहुंचती है, "
+                                    f"यात्रा समय {duration} है"
+                                )
+                            else:
+                                phrases.append(
+                                    f"{number} {name} departs at {departure}, arrives at {arrival}, "
+                                    f"and takes {duration}"
+                                )
+                        intro = {
+                            "kn-IN": f"ಒಟ್ಟು {total} ರೈಲುಗಳು ಸಿಕ್ಕಿವೆ.",
+                            "hi-IN": f"कुल {total} ट्रेनें मिली हैं।",
+                        }.get(reply_language, f"I found {total} trains.")
+                        raw_reply = intro + " " + ". ".join(phrases) + "."
+                    else:
+                        raw_reply = str(
+                            parsed_reply.get("response")
+                            or parsed_reply.get("reply")
+                            or parsed_reply.get("text")
+                            or raw_reply
+                        )
+            except _json_mod.JSONDecodeError:
+                wrapped = re.search(r'"(?:response|reply|text)"\s*:\s*"([^"]+)', raw_reply)
+                if wrapped:
+                    raw_reply = wrapped.group(1)
+            text = _dedup_reply(raw_reply.strip())
+            if reply_language == "kn-IN" and text.lower().startswith("haan"):
+                text = "haudu" + text[4:]
+            text = text.strip()[:1200]
             if text:
-                print(f"  [voice_reply] {text!r}", flush=True)
+                safe_log = text.encode("ascii", errors="backslashreplace").decode("ascii")
+                print(f"  [voice_reply] {safe_log!r}", flush=True)
                 return text
         except Exception as exc:
             print(f"  [voice_reply] generation failed: {exc}", flush=True)
@@ -578,6 +702,8 @@ Rules:
             return "Could not complete the task. Please try again."
         stubs = {
             "train_status": {"hi-IN": "Train ka status check ho gaya.", "kn-IN": "Train status check aaagide.", "en-IN": "Train status checked."},
+            "train_search": {"hi-IN": "Train ke options mil gaye.", "kn-IN": "Railu aykegalu sigive.", "en-IN": "Train options found."},
+            "shopping_orders": {"hi-IN": "Aapke order aur delivery status mil gaye.", "kn-IN": "Nimma order mattu delivery status sigide.", "en-IN": "Order and delivery status found."},
             "cricket":      {"hi-IN": "Cricket score mil gaya.", "kn-IN": "Cricket score sigiide.", "en-IN": "Cricket score found."},
             "weather":      {"hi-IN": "Mausam ki jaankari mil gayi.", "kn-IN": "Havamana mahiti sigiide.", "en-IN": "Weather info found."},
             "blinkit":      {"hi-IN": "Blinkit pe daam mil gaya.", "kn-IN": "Blinkit price sigiide.", "en-IN": "Blinkit price found."},

@@ -43,6 +43,8 @@ from backend.models.sarvam import SarvamClient
 from backend.tasks.blinkit import BlinkitTask
 from backend.tasks.cricket import CricketTask
 from backend.tasks.ntes import NTESTask
+from backend.tasks.orders import ShoppingOrdersTask
+from backend.tasks.railway import RailwayJourneyTask, normalize_travel_date
 from backend.tasks.weather import WeatherTask
 
 
@@ -180,6 +182,11 @@ class RunRequest(BaseModel):
     location: str = Field(default="560001")
     city: str = Field(default="Bangalore")
     question: str = Field(default="")
+    origin: str = Field(default="Bangalore")
+    destination: str = Field(default="Chennai")
+    travel_date: str = Field(default="")
+    platform: str = Field(default="all")
+    shopping_action: str = Field(default="orders")
     # Optimised agent layers: 1=DOM, 2=summarisation, 4=speculation (cascade always on).
     # Default [1,2,4] = all layers.  Set e.g. [1,2] to disable speculation.
     layers: list[int] = Field(default=[1, 2, 4])
@@ -223,7 +230,7 @@ async def clear_benchmark_results() -> dict[str, str]:
 
 @app.post("/run")
 async def run_both(request: RunRequest) -> dict[str, str]:
-    if request.task not in {"ntes", "blinkit", "weather"}:
+    if request.task not in {"ntes", "railway_journey", "shopping_orders", "blinkit", "weather"}:
         raise HTTPException(status_code=404, detail=f"Unknown task: {request.task}")
 
     run_id = str(uuid.uuid4())
@@ -242,6 +249,18 @@ async def run_both(request: RunRequest) -> dict[str, str]:
             city=request.city,
             question=request.question,
         )
+    elif request.task == "railway_journey":
+        task = RailwayJourneyTask(
+            origin=request.origin,
+            destination=request.destination,
+            travel_date=normalize_travel_date(request.travel_date),
+        )
+    elif request.task == "shopping_orders":
+        platform = request.platform if request.platform in {"amazon", "flipkart", "all"} else "all"
+        action = request.shopping_action if request.shopping_action in {
+            "orders", "cart", "wishlist", "saved_items", "buy_again", "browsing_history", "invoices"
+        } else "orders"
+        task = ShoppingOrdersTask(platform=platform, action=action, query=request.question)  # type: ignore[arg-type]
     else:
         task = NTESTask(headed=request.headed, config_name="full_optimized")
     METERS[run_id] = meter
@@ -254,8 +273,18 @@ async def run_both(request: RunRequest) -> dict[str, str]:
 
     async def execute() -> None:
         task.reset()
-        if request.task in {"blinkit", "weather"}:
-            agents = [OptimizedAgent(meter, flags=Flags.from_layers(request.layers))]
+        if request.task in {"blinkit", "weather", "railway_journey", "shopping_orders"}:
+            flags = Flags.from_layers(request.layers)
+            router = None
+            if not os.environ.get("OPENROUTER_API_KEY"):
+                flags = Flags(
+                    dom=flags.dom,
+                    summarization=flags.summarization,
+                    cascade=False,
+                    speculation=flags.speculation,
+                )
+                router = SarvamActionRouter()
+            agents = [OptimizedAgent(meter, flags=flags, router=router)]
         else:
             agents = [
                 BaselineAgent(meter),
@@ -319,6 +348,47 @@ def _build_task_from_intent(intent: dict) -> Any | None:
         if not (4 <= len(num) <= 5):
             return None
         return NTESTask(config_name="full_optimized", train_number=num)
+    if task_type == "train_search":
+        origin = (intent.get("origin") or "").strip()
+        destination = (intent.get("destination") or "").strip()
+        travel_date = normalize_travel_date(intent.get("travel_date"))
+        if not origin or not destination or not travel_date:
+            return None
+        return RailwayJourneyTask(
+            origin=origin,
+            destination=destination,
+            travel_date=travel_date,
+            preferences=(intent.get("travel_preferences") or "").strip(),
+        )
+    if task_type == "shopping_orders":
+        platform = (intent.get("platform") or "all").lower()
+        if platform not in {"amazon", "flipkart", "all"}:
+            platform = "all"
+        query = (intent.get("shopping_query") or intent.get("order_query") or "").strip()
+        action = (intent.get("shopping_action") or "").lower()
+        if action not in {
+            "orders", "cart", "wishlist", "saved_items", "buy_again", "browsing_history", "invoices"
+        }:
+            lowered = query.lower()
+            if "cart" in lowered:
+                action = "cart"
+            elif "wish" in lowered or "list" in lowered:
+                action = "wishlist"
+            elif "saved" in lowered or "later" in lowered:
+                action = "saved_items"
+            elif "buy again" in lowered or "repurchase" in lowered:
+                action = "buy_again"
+            elif "history" in lowered or "viewed" in lowered or "brows" in lowered:
+                action = "browsing_history"
+            elif "invoice" in lowered or "bill" in lowered:
+                action = "invoices"
+            else:
+                action = "orders"
+        return ShoppingOrdersTask(
+            platform=platform,
+            action=action,  # type: ignore[arg-type]
+            query=query or "show my shopping activity",
+        )
     if task_type == "cricket":
         q = intent.get("cricket_query") or intent.get("team") or ""
         return CricketTask(config_name="full_optimized", query=q)
@@ -342,9 +412,11 @@ def _clarification_for(task_type: str, intent: dict) -> str:
         return f"'{raw}' doesn't look like a valid train number. Please say a 4-5 digit number."
     if task_type == "blinkit":
         return "Which product are you looking for on Blinkit? Please say the product name."
+    if task_type == "train_search":
+        return "Please include the origin, destination, and travel date."
     if task_type == "unknown":
         return (
-            "I can help with train status, cricket score, weather, or Blinkit prices. "
+            "I can help with train journeys, order tracking, train status, cricket, weather, or Blinkit. "
             "Please say what you need."
         )
     return "Could not understand the query with sufficient confidence. Please try again."
@@ -392,9 +464,12 @@ async def voice_run(
         print(f"[voice] intent EXCEPTION: {type(exc).__name__}: {exc}", flush=True)
         raise HTTPException(status_code=502, detail=f"Intent extraction failed: {exc}")
 
-    # Saarika language detection is more reliable for reply language
-    if detected_lang and detected_lang != language_hint:
-        intent.setdefault("reply_language", detected_lang)
+    # Honor the user's explicit language pill. Romanized Hindi/Kannada is often
+    # misclassified as English by text-only intent models.
+    if language_hint not in ("auto", ""):
+        intent["reply_language"] = language_hint
+    elif detected_lang:
+        intent["reply_language"] = detected_lang
 
     task_type = intent.get("task", "unknown")
     conf = float(intent.get("confidence", 0.0))

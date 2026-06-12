@@ -561,6 +561,196 @@ async def _prepare_ntes_train_status(page, task: Any) -> bool:
         return False
 
 
+async def _prepare_ntes_journey(page, task: Any) -> str:
+    """Open NTES trains-between-stations and submit both stations."""
+    if getattr(task, "name", "") != "railway_journey":
+        return ""
+
+    async def select_station(selector: str, station: str) -> None:
+        field = page.locator(selector)
+        await field.fill(station)
+        await asyncio.sleep(1.5)
+        await field.press("ArrowDown")
+        await field.press("Enter")
+
+    try:
+        await page.get_by_text("Trains B/w Stations", exact=True).first.click(timeout=5_000)
+        await page.locator("#jFromStationInput").wait_for(state="visible", timeout=5_000)
+        await select_station("#jFromStationInput", str(task.origin))
+        await select_station("#jToStationInput", str(task.destination))
+        await page.locator('input[name="find"]').click(timeout=5_000)
+        await asyncio.sleep(3)
+        return await page.inner_text("body")
+    except Exception as exc:
+        print(f"[opt] deterministic NTES journey setup failed: {exc}", flush=True)
+        return ""
+
+
+async def _wait_for_commerce_login(page, task: Any) -> bool:
+    """Pause a visible commerce run while the user completes login or OTP."""
+    if getattr(task, "name", "") != "shopping_orders":
+        return False
+    login_markers = ("/signin", "/account/login", "ap/signin")
+    if not any(marker in page.url.lower() for marker in login_markers):
+        return False
+    wait_seconds = int(getattr(task, "manual_auth_wait_seconds", 180))
+    print(
+        f"[commerce] login required; waiting up to {wait_seconds}s for manual completion",
+        flush=True,
+    )
+    for _ in range(max(1, wait_seconds // 2)):
+        await asyncio.sleep(2)
+        if not any(marker in page.url.lower() for marker in login_markers):
+            await asyncio.sleep(2)
+            return True
+    return False
+
+
+async def _extract_shopping_dom(page, task: Any) -> str:
+    """Extract visible commerce cards without navigation, ads, or recommendations."""
+    if getattr(task, "name", "") != "shopping_orders":
+        return ""
+    action = str(getattr(task, "action", "orders"))
+    host = (urlparse(page.url).hostname or "").lower()
+    platform = "amazon" if "amazon." in host else "flipkart" if "flipkart." in host else ""
+    if not platform:
+        return ""
+    if platform == "flipkart":
+        try:
+            items = await page.evaluate(
+                r"""action => {
+                    const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+                    const priceMatches = text => Array.from(text.matchAll(/₹\s*[\d,]+(?:\.\d{2})?/g), m => m[0]);
+                    if (action === 'cart') {
+                        const actionNodes = Array.from(document.querySelectorAll('*')).filter(
+                            node => clean(node.textContent) === 'Save for later'
+                        );
+                        const candidates = [];
+                        for (const actionNode of actionNodes) {
+                            let node = actionNode.parentElement;
+                            for (let i = 0; i < 12 && node; i++, node = node.parentElement) {
+                                const text = clean(node.innerText);
+                                if (/Qty:\s*\d+/i.test(text) && /₹\s*[\d,]+/.test(text) && /Remove/i.test(text)) {
+                                    if (!candidates.includes(node)) candidates.push(node);
+                                    break;
+                                }
+                            }
+                        }
+                        const seen = new Set();
+                        return candidates.slice(0, 20).map(node => {
+                            const text = clean(node.innerText);
+                            const lines = String(node.innerText || '').split(/\n+/).map(clean).filter(Boolean);
+                            const qtyIndex = lines.findIndex(line => /^Qty:/i.test(line));
+                            const title = qtyIndex >= 0 ? (lines[qtyIndex + 1] || '') : (lines[0] || '');
+                            const prices = priceMatches(text);
+                            const price = prices.length >= 2 ? prices[1] : prices[0] || '';
+                            const quantity = qtyIndex >= 0 ? (lines[qtyIndex].match(/\d+/)?.[0] || '') : '';
+                            const status = /out of stock/i.test(text) ? 'Out of stock' : '';
+                            const delivery = text.match(/Delivery by\s+[^₹]+?(?=Save for later|Remove|$)/i)?.[0] || '';
+                            return {title, price, quantity, status, detail: clean(`${delivery} ${text}`).slice(0, 700)};
+                        }).filter(item => item.title && !seen.has(item.title) && seen.add(item.title));
+                    }
+                    if (action === 'wishlist' || action === 'saved_items') {
+                        return Array.from(document.querySelectorAll('.KBj2DG')).slice(0, 20).map(node => {
+                            const text = clean(node.innerText);
+                            const title = clean(node.querySelector('.zJFk58')?.textContent);
+                            const price = clean(node.querySelector('.hZ3P6w')?.textContent);
+                            const status = /currently unavailable/i.test(text) ? 'Currently unavailable' : 'Available';
+                            return {title, price, quantity: '', status, detail: text.slice(0, 700)};
+                        }).filter(item => item.title);
+                    }
+                    if (action === 'orders' || action === 'invoices' || action === 'buy_again') {
+                        return Array.from(document.querySelectorAll('.lxQ2Ra')).slice(0, 20).map(titleNode => {
+                            let node = titleNode;
+                            for (let i = 0; i < 6 && node; i++, node = node.parentElement) {
+                                const text = clean(node.innerText);
+                                if (/(Delivered|Cancelled|Refund|On the way|Returned|Shipped)/i.test(text)) {
+                                    const price = priceMatches(text)[0] || '';
+                                    const status = text.match(/(Delivered on [^₹]+?|Cancelled on [^₹]+?|Refund Completed|On the way|Returned|Shipped)(?=Your|Rate|$)/i)?.[0] || '';
+                                    return {title: clean(titleNode.textContent), price, quantity: '', status: clean(status), detail: text.slice(0, 700)};
+                                }
+                            }
+                            return null;
+                        }).filter(Boolean);
+                    }
+                    return [];
+                }""",
+                action,
+            )
+        except Exception:
+            return ""
+        if not items:
+            return ""
+        return "SHOPPING_DATA " + json.dumps(
+            {"platform": platform, "action": action, "items": items},
+            ensure_ascii=False,
+        )
+    selectors = {
+        "amazon": {
+            "cart": ["div.sc-list-item[data-asin]"],
+            "saved_items": ["#sc-saved-cart div.sc-list-item[data-asin]"],
+            "wishlist": ["li.g-item-sortable", "div[data-itemid]"],
+            "buy_again": ["div[data-asin]"],
+            "browsing_history": ["div[data-asin]"],
+            "orders": [".order-card", ".js-order-card"],
+            "invoices": [".order-card", ".js-order-card"],
+        },
+        "flipkart": {},
+    }[platform].get(action, [])
+    try:
+        items = await page.evaluate(
+            r"""({selectors, platform, action}) => {
+                const clean = value => String(value || '').replace(/\s+/g, ' ').trim();
+                const nodes = [];
+                for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        if (!nodes.includes(node)) nodes.push(node);
+                    }
+                    if (nodes.length) break;
+                }
+                return nodes.filter(node => {
+                    if (platform !== 'amazon') return true;
+                    const isSaved = Boolean(node.closest('#sc-saved-cart')) || /move to cart/i.test(node.innerText || '');
+                    return action === 'saved_items' ? isSaved : action === 'cart' ? !isSaved : true;
+                }).slice(0, 20).map(node => {
+                    const titleSelectors = platform === 'amazon'
+                        ? ['.a-truncate-full', 'a.sc-product-link', '.sc-product-title', 'h2 a', 'h2', 'h3', 'a[title]']
+                        : ['a[title]', 'a[href*="/p/"]', 'div[title]'];
+                    const priceSelectors = platform === 'amazon'
+                        ? ['.sc-product-price', '.a-price .a-offscreen']
+                        : ['div[class]'];
+                    let title = '';
+                    for (const selector of titleSelectors) {
+                        const el = node.querySelector(selector);
+                        title = clean(el?.getAttribute('title') || el?.textContent);
+                        if (title) break;
+                    }
+                    title = title.replace(/\s*Opens in a new tab\s*$/i, '').trim();
+                    let price = '';
+                    for (const selector of priceSelectors) {
+                        const el = node.querySelector(selector);
+                        const candidate = clean(el?.textContent);
+                        const match = candidate.match(/(?:₹|Rs\.)\s*[\d,]+(?:\.\d{2})?/i);
+                        if (match) { price = match[0]; break; }
+                    }
+                    const text = clean(node.innerText).slice(0, 700);
+                    const quantity = clean(node.querySelector('.a-dropdown-prompt')?.textContent);
+                    const statusMatch = text.match(/delivered|arriving[^.]{0,80}|shipped|out for delivery|cancelled|in stock|out of stock/i);
+                    return {title, price, quantity, status: statusMatch?.[0] || '', detail: text};
+                }).filter(item => item.title || item.price || item.status);
+            }""",
+            {"selectors": selectors, "platform": platform, "action": action},
+        )
+    except Exception:
+        return ""
+    if not items:
+        return ""
+    return "SHOPPING_DATA " + json.dumps(
+        {"platform": platform, "action": action, "items": items},
+        ensure_ascii=False,
+    )
+
+
 async def _execute_action(page, action: dict, snap: DomSnapshot | None) -> ActionOutcome:
     """Execute one action and report whether Playwright completed it cleanly."""
     kind = action.get("action", "wait")
@@ -853,6 +1043,7 @@ class OptimizedAgent:
         success = False
         final_step_desc = "max_steps_reached"
         final_page_text = ""
+        collected_page_text: list[str] = []
         spec_attempts = spec_hits = 0
         spec_meaningful_attempts = spec_meaningful_hits = 0
         consec_spec_hits = 0
@@ -867,6 +1058,7 @@ class OptimizedAgent:
 
         conversation: list[dict] = []
         pending_spec: dict | None = None
+        max_steps = int(getattr(task, "max_steps", MAX_STEPS))
 
         goal_prefix = (
             f"Goal: {task.objective}\n"
@@ -897,20 +1089,31 @@ class OptimizedAgent:
                     f"display={os.environ.get('DISPLAY', '')!r} os={sys.platform}",
                     flush=True,
                 )
-            browser = await pw.chromium.launch(
-                headless=launch_headless,
-                slow_mo=launch_slow_mo,
-                args=launch_args,
+            viewport = (
+                {"width": 1280, "height": 800}
+                if task.config_name == "full_optimized"
+                else {"width": 1920, "height": 1080}
             )
-            context = await browser.new_context(
-                viewport=(
-                    {"width": 1280, "height": 800}
-                    if task.config_name == "full_optimized"
-                    else {"width": 1920, "height": 1080}
-                ),
-                accept_downloads=True,
-            )
-            page = await context.new_page()
+            profile_dir = getattr(task, "browser_profile_dir", "")
+            if profile_dir:
+                Path(profile_dir).mkdir(parents=True, exist_ok=True)
+                context = await pw.chromium.launch_persistent_context(
+                    profile_dir,
+                    headless=launch_headless,
+                    slow_mo=launch_slow_mo,
+                    args=launch_args,
+                    viewport=viewport,
+                    accept_downloads=True,
+                )
+                browser = context.browser
+            else:
+                browser = await pw.chromium.launch(
+                    headless=launch_headless,
+                    slow_mo=launch_slow_mo,
+                    args=launch_args,
+                )
+                context = await browser.new_context(viewport=viewport, accept_downloads=True)
+            page = context.pages[0] if context.pages else await context.new_page()
             if task.config_name == "full_optimized":
                 await page.bring_to_front()
 
@@ -932,7 +1135,24 @@ class OptimizedAgent:
             try:
                 print(f"[opt] opening start_url={task.start_url}", flush=True)
                 await page.goto(task.start_url, wait_until="domcontentloaded", timeout=30_000)
+                await _wait_for_commerce_login(page, task)
+                if getattr(task, "name", "") == "shopping_orders" and "flipkart.com" in page.url.lower():
+                    await asyncio.sleep(3)
                 self.allowed_domain = _registered_domain(urlparse(page.url).hostname or "")
+                journey_text = await _prepare_ntes_journey(page, task)
+                if journey_text:
+                    collected_page_text.append(
+                        f"PAGE https://enquiry.indianrail.gov.in/mntes/\n{journey_text}"
+                    )
+                    route_log.append({
+                        "step": 0,
+                        "tier": -1,
+                        "model": "deterministic_ntes_journey_setup",
+                        "reason": "submit_origin_and_destination",
+                        "action": "train_search",
+                        "playwright_ok": True,
+                        "action_success": True,
+                    })
                 if await _prepare_blinkit_for_product_search(page, task):
                     route_log.append({
                         "step": 0,
@@ -974,12 +1194,20 @@ class OptimizedAgent:
                         "consecutive_uncertain_after": consecutive_uncertain,
                     })
 
-                while step < MAX_STEPS:
+                while step < max_steps:
                     step += 1
 
                     current_body = await page.inner_text("body")
-                    final_page_text = current_body
-                    if task.success(current_body):
+                    shopping_data = await _extract_shopping_dom(page, task)
+                    if shopping_data:
+                        current_body += f"\n{shopping_data}"
+                    if getattr(task, "aggregate_page_text", False):
+                        collected_page_text.append(f"PAGE {page.url}\n{current_body}")
+                        collected_page_text = collected_page_text[-12:]
+                        final_page_text = "\n\n".join(collected_page_text)
+                    else:
+                        final_page_text = current_body
+                    if task.success(final_page_text):
                         success = True
                         final_step_desc = f"status_found_before_step_{step}"
                         break
@@ -1005,7 +1233,7 @@ class OptimizedAgent:
                         "spec" if flags.speculation   else "",
                     ]))
                     print(
-                        f"[opt step {step:02d}/{MAX_STEPS}]  url={current_url}  "
+                        f"[opt step {step:02d}/{max_steps}]  url={current_url}  "
                         f"elements={element_count}  failures={consecutive_failures}  "
                         f"layers=[{layer_tag}]",
                         flush=True,
@@ -1104,7 +1332,7 @@ class OptimizedAgent:
                             # Build user message for this step.
                             user_text = (
                                 f"{goal_prefix}\n"
-                                f"Step {step}/{MAX_STEPS}\n\n"
+                                f"Step {step}/{max_steps}\n\n"
                                 f"{page_text}"
                             )
 
@@ -1175,7 +1403,7 @@ class OptimizedAgent:
                     # (keeps summarization and Sarvam-M compatible).
                     conv_user_text = (
                         f"{goal_prefix}\n"
-                        f"Step {step}/{MAX_STEPS}\n\n"
+                        f"Step {step}/{max_steps}\n\n"
                         f"{page_text}"
                     )
                     conversation.append({"role": "user",      "content": conv_user_text})
@@ -1315,8 +1543,12 @@ class OptimizedAgent:
                     if outcome.done:
                         await asyncio.sleep(2)
                         current_body = await page.inner_text("body")
-                        final_page_text = current_body
-                        success = task.success(current_body)
+                        if getattr(task, "aggregate_page_text", False):
+                            collected_page_text.append(f"PAGE {page.url}\n{current_body}")
+                            final_page_text = "\n\n".join(collected_page_text[-12:])
+                        else:
+                            final_page_text = current_body
+                        success = task.success(final_page_text)
                         final_step_desc = f"done_signal_step_{step}_status={'yes' if success else 'no'}"
                         break
 
@@ -1335,22 +1567,17 @@ class OptimizedAgent:
                     )
                 )
             finally:
-                keep_open_for_manual_close = task.config_name == "full_optimized" and not launch_headless
-                if keep_open_for_manual_close:
+                if not launch_headless and browser and browser.is_connected():
+                    close_delay = float(getattr(task, "browser_close_delay_seconds", 5))
                     print(
-                        "[playwright] run finished; leaving browser open until you close it manually",
+                        f"[playwright] run finished; closing browser in {close_delay:g}s",
                         flush=True,
                     )
-                    while browser.is_connected():
-                        try:
-                            if not context.pages or all(p.is_closed() for p in context.pages):
-                                break
-                        except Exception:
-                            break
-                        await asyncio.sleep(1)
-                if browser.is_connected():
+                    await asyncio.sleep(close_delay)
+                if browser and browser.is_connected():
                     await context.close()
-                    await browser.close()
+                    if browser.is_connected():
+                        await browser.close()
 
         elapsed = time.perf_counter() - started
         spec_summary = f"{spec_hits}/{spec_attempts} hits" if spec_attempts else "n/a"
@@ -1378,6 +1605,11 @@ class OptimizedAgent:
             if hasattr(task, "extract_answer")
             else extract_status_string(final_page_text)
         )
+        structured_result = (
+            task.structured_result(final_page_text)
+            if hasattr(task, "structured_result")
+            else None
+        )
         await self.meter.publish(
             MeterEvent(
                 run_id=self.meter.run_id,
@@ -1400,6 +1632,8 @@ class OptimizedAgent:
                         "speculation":   flags.speculation,
                     },
                     "extracted_answer": extracted_answer,
+                    "structured_result": structured_result,
+                    "success": success,
                     "task_type": getattr(task, "name", "unknown"),
                 }),
             )

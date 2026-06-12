@@ -296,6 +296,8 @@ class BaselineAgent:
                     )
                 )
             finally:
+                if task.headed and browser.is_connected():
+                    await asyncio.sleep(float(getattr(task, "browser_close_delay_seconds", 5)))
                 await context.close()
                 await browser.close()
 

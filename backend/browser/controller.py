@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,6 +10,7 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 @dataclass(slots=True)
 class BrowserController:
     headed: bool = False
+    close_delay_seconds: float = 5.0
     browser: Browser | None = None
     context: BrowserContext | None = None
     page: Page | None = None
@@ -22,6 +24,8 @@ class BrowserController:
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        if self.headed and self.context and self.context.pages:
+            await asyncio.sleep(self.close_delay_seconds)
         if self.context:
             await self.context.close()
         if self.browser:
