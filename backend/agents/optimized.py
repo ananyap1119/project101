@@ -38,7 +38,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 from PIL import Image
 
@@ -448,7 +448,7 @@ async def _blinkit_visible_text(page) -> str:
 
 async def _prepare_blinkit_for_product_search(page, task: Any) -> bool:
     """Best-effort deterministic Blinkit setup before handing control to the model."""
-    if getattr(task, "name", "") != "blinkit" or "blinkit.com" not in page.url.lower():
+    if getattr(task, "name", "") not in {"blinkit", "blinkit_planner"} or "blinkit.com" not in page.url.lower():
         return False
 
     pincode = str(getattr(task, "location", _BLINKIT_PINCODE) or _BLINKIT_PINCODE)
@@ -506,6 +506,94 @@ async def _prepare_blinkit_for_product_search(page, task: Any) -> bool:
         changed = True
 
     return changed
+
+
+async def _build_blinkit_grocery_cart(page, task: Any) -> dict | None:
+    """Search and add a bounded grocery plan. Never opens checkout."""
+    if getattr(task, "name", "") != "blinkit_planner":
+        return None
+    entries: list[dict[str, Any]] = []
+    for planned in list(getattr(task, "items", []))[:12]:
+        requested_name = str(getattr(planned, "name", "") or "").strip()
+        query = str(getattr(planned, "search_query", "") or requested_name).strip()
+        requested_quantity = max(1, min(int(getattr(planned, "quantity", 1) or 1), 6))
+        result = {
+            "requested_item": requested_name,
+            "requested_amount": str(getattr(planned, "required_amount", "") or ""),
+            "requested_quantity": requested_quantity,
+            "product_name": "",
+            "pack_size": "",
+            "price": "",
+            "added_quantity": 0,
+            "status": "failed",
+        }
+        try:
+            await page.goto(
+                f"https://blinkit.com/s/?q={quote_plus(query)}",
+                wait_until="domcontentloaded",
+                timeout=30_000,
+            )
+            await asyncio.sleep(2)
+            body = (await page.inner_text("body")).lower()
+            if "access denied" in body or "you have been blocked" in body:
+                result["status"] = "failed"
+                entries.append(result)
+                break
+
+            cards = page.locator("div.tw-relative.tw-flex.tw-h-full.tw-flex-col")
+            card_count = await cards.count()
+            selected = None
+            for index in range(min(card_count, 20)):
+                card = cards.nth(index)
+                text = " ".join((await card.inner_text()).split())
+                if "ADD" in text or re.search(r"\s\d+\s*$", text):
+                    selected = card
+                    break
+            if selected is None:
+                result["status"] = "unavailable"
+                entries.append(result)
+                continue
+
+            card_text = "\n".join(line.strip() for line in (await selected.inner_text()).splitlines() if line.strip())
+            lines = card_text.splitlines()
+            price_match = re.search(r"(?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d{1,2})?", card_text, re.I)
+            pack_match = re.search(r"\b\d+(?:\.\d+)?\s*(?:kg|g|l|ml|pcs?|pieces?|pack)\b", card_text, re.I)
+            title_lines = [
+                line for line in lines
+                if line != "ADD" and not re.fullmatch(r"\d+% OFF", line, re.I)
+                and not re.fullmatch(r"\d+\s*MINS?", line, re.I)
+                and not re.fullmatch(r"(?:₹|Rs\.?|INR)\s*[\d,]+(?:\.\d{1,2})?", line, re.I)
+                and not re.fullmatch(r"\d+", line)
+                and not (pack_match and line == pack_match.group(0))
+            ]
+            result["product_name"] = title_lines[0] if title_lines else query
+            result["pack_size"] = pack_match.group(0) if pack_match else ""
+            result["price"] = price_match.group(0).replace(" ", "") if price_match else ""
+
+            add = selected.get_by_text("ADD", exact=True)
+            if await add.count():
+                await add.click(timeout=5_000)
+                await asyncio.sleep(0.7)
+            quantity_box = selected.locator("div.tw-bg-base-green").first
+            if not await quantity_box.count():
+                result["status"] = "failed"
+                entries.append(result)
+                continue
+            quantity_text = " ".join((await quantity_box.inner_text()).split())
+            quantity_match = re.search(r"\d+", quantity_text)
+            current_quantity = int(quantity_match.group(0)) if quantity_match else 1
+            for _ in range(max(0, requested_quantity - current_quantity)):
+                plus = quantity_box.locator("button").last
+                await plus.click(timeout=3_000)
+                await asyncio.sleep(0.35)
+            quantity_text = " ".join((await quantity_box.inner_text()).split())
+            quantity_match = re.search(r"\d+", quantity_text)
+            result["added_quantity"] = int(quantity_match.group(0)) if quantity_match else requested_quantity
+            result["status"] = "added"
+        except Exception as exc:
+            print(f"[blinkit-planner] failed item={query!r}: {exc}", flush=True)
+        entries.append(result)
+    return {"entries": entries}
 
 
 async def _page_has_input_value(page, value: str) -> bool:
@@ -1172,6 +1260,25 @@ class OptimizedAgent:
                         "success_detail": "location_pincode_and_product_search_attempted",
                         "consecutive_failures_after": consecutive_failures,
                         "consecutive_uncertain_after": consecutive_uncertain,
+                    })
+                planner_result = await _build_blinkit_grocery_cart(page, task)
+                if planner_result is not None:
+                    planner_data = "GROCERY_PLANNER_DATA " + json.dumps(
+                        planner_result,
+                        ensure_ascii=False,
+                    )
+                    collected_page_text.append(planner_data)
+                    route_log.append({
+                        "step": 0,
+                        "tier": -1,
+                        "model": "deterministic_blinkit_cart_builder",
+                        "reason": "search_add_and_set_quantity",
+                        "action": "build_grocery_cart",
+                        "playwright_ok": True,
+                        "action_success": any(
+                            entry.get("status") == "added"
+                            for entry in planner_result.get("entries", [])
+                        ),
                     })
                 if await _prepare_ntes_train_status(page, task):
                     route_log.append({

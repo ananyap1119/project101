@@ -42,6 +42,7 @@ from backend.instrumentation.meter import BudgetExceededError, MeterEvent, RunMe
 from backend.models.sarvam import SarvamClient
 from backend.tasks.blinkit import BlinkitTask
 from backend.tasks.cricket import CricketTask
+from backend.tasks.grocery import BlinkitPlannerTask, GroceryItem
 from backend.tasks.ntes import NTESTask
 from backend.tasks.orders import ShoppingOrdersTask
 from backend.tasks.railway import RailwayJourneyTask, normalize_travel_date
@@ -187,6 +188,8 @@ class RunRequest(BaseModel):
     travel_date: str = Field(default="")
     platform: str = Field(default="all")
     shopping_action: str = Field(default="orders")
+    grocery_mode: str = Field(default="meal_plan")
+    grocery_items: list[dict[str, Any]] = Field(default_factory=list)
     # Optimised agent layers: 1=DOM, 2=summarisation, 4=speculation (cascade always on).
     # Default [1,2,4] = all layers.  Set e.g. [1,2] to disable speculation.
     layers: list[int] = Field(default=[1, 2, 4])
@@ -230,7 +233,7 @@ async def clear_benchmark_results() -> dict[str, str]:
 
 @app.post("/run")
 async def run_both(request: RunRequest) -> dict[str, str]:
-    if request.task not in {"ntes", "railway_journey", "shopping_orders", "blinkit", "weather"}:
+    if request.task not in {"ntes", "railway_journey", "shopping_orders", "blinkit", "blinkit_planner", "weather"}:
         raise HTTPException(status_code=404, detail=f"Unknown task: {request.task}")
 
     run_id = str(uuid.uuid4())
@@ -240,6 +243,16 @@ async def run_both(request: RunRequest) -> dict[str, str]:
             headed=request.headed,
             config_name="full_optimized",
             product=request.product,
+            location=request.location,
+        )
+    elif request.task == "blinkit_planner":
+        mode = request.grocery_mode if request.grocery_mode in {
+            "meal_plan", "missing_ingredients", "household_restock"
+        } else "meal_plan"
+        task = BlinkitPlannerTask(
+            request=request.question,
+            mode=mode,  # type: ignore[arg-type]
+            items=[GroceryItem.model_validate(item) for item in request.grocery_items],
             location=request.location,
         )
     elif request.task == "weather":
@@ -273,7 +286,7 @@ async def run_both(request: RunRequest) -> dict[str, str]:
 
     async def execute() -> None:
         task.reset()
-        if request.task in {"blinkit", "weather", "railway_journey", "shopping_orders"}:
+        if request.task in {"blinkit", "blinkit_planner", "weather", "railway_journey", "shopping_orders"}:
             flags = Flags.from_layers(request.layers)
             router = None
             if not os.environ.get("OPENROUTER_API_KEY"):
@@ -401,6 +414,35 @@ def _build_task_from_intent(intent: dict) -> Any | None:
     if task_type == "blinkit":
         product = intent.get("product") or "milk"
         return BlinkitTask(config_name="full_optimized", product=product)
+    if task_type == "blinkit_planner":
+        mode = intent.get("grocery_mode") or "meal_plan"
+        if mode not in {"meal_plan", "missing_ingredients", "household_restock"}:
+            mode = "meal_plan"
+        raw_items = intent.get("grocery_items") or []
+        items: list[GroceryItem] = []
+        for raw_item in raw_items[:12]:
+            if not isinstance(raw_item, dict):
+                continue
+            normalized_item = dict(raw_item)
+            try:
+                quantity = int(normalized_item.get("quantity", 1))
+            except (TypeError, ValueError):
+                quantity = 1
+            normalized_item["quantity"] = quantity if 1 <= quantity <= 6 else 1
+            try:
+                item = GroceryItem.model_validate(normalized_item)
+            except Exception:
+                continue
+            if item.name and item.search_query:
+                items.append(item)
+        if not items:
+            return None
+        return BlinkitPlannerTask(
+            request=(intent.get("grocery_request") or "prepare my grocery cart").strip(),
+            mode=mode,
+            items=items,
+            pantry_items=[str(item) for item in (intent.get("pantry_items") or [])],
+        )
     return None
 
 
@@ -412,6 +454,8 @@ def _clarification_for(task_type: str, intent: dict) -> str:
         return f"'{raw}' doesn't look like a valid train number. Please say a 4-5 digit number."
     if task_type == "blinkit":
         return "Which product are you looking for on Blinkit? Please say the product name."
+    if task_type == "blinkit_planner":
+        return "Please tell me the meal, recipe, or household restock you want to prepare."
     if task_type == "train_search":
         return "Please include the origin, destination, and travel date."
     if task_type == "unknown":

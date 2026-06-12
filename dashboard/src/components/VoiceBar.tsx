@@ -12,6 +12,7 @@ export type IntentResult = {
     travel_date?: string | null;
     platform?: "amazon" | "flipkart" | "all" | null;
     shopping_action?: "orders" | "cart" | "wishlist" | "saved_items" | "buy_again" | "browsing_history" | "invoices" | null;
+    grocery_mode?: "meal_plan" | "missing_ingredients" | "household_restock" | null;
     city: string | null;
     product: string | null;
     team: string | null;
@@ -29,6 +30,7 @@ const TASK_META: Record<string, { icon: string; label: string }> = {
   cricket:      { icon: "🏏", label: "Cricket" },
   weather:      { icon: "🌤", label: "Weather" },
   blinkit:      { icon: "🛒", label: "Blinkit" },
+  blinkit_planner: { icon: "GP", label: "Grocery Planner" },
   unknown:      { icon: "?",  label: "Unknown" },
 };
 

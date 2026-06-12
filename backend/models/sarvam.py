@@ -68,6 +68,20 @@ _TRAIN_NUMBER_WORDS = {
 }
 
 
+def _language_from_script(text: str) -> str | None:
+    script_ranges = (
+        ("hi-IN", 0x0900, 0x097F),
+        ("ta-IN", 0x0B80, 0x0BFF),
+        ("te-IN", 0x0C00, 0x0C7F),
+        ("kn-IN", 0x0C80, 0x0CFF),
+        ("ml-IN", 0x0D00, 0x0D7F),
+    )
+    for language, start, end in script_ranges:
+        if any(start <= ord(char) <= end for char in text):
+            return language
+    return None
+
+
 def _train_number_from_transcript(transcript: str) -> str | None:
     """Extract a 4-5 digit train number without an LLM when possible."""
     digit_match = re.search(r"\b\d(?:[\s-]*\d){3,4}\b", transcript)
@@ -443,6 +457,7 @@ You are a voice command parser for an Indian AI assistant that handles:
   - Train live running status (NTES)
   - Train discovery between an origin and destination, with destination weather
   - Read-only Amazon and Flipkart shopping activity
+  - Blinkit meal planning, missing ingredients, and weekly household restocking
   - Cricket match scores (Cricbuzz)
   - Weather lookup (wttr.in)
   - Grocery prices on Blinkit
@@ -450,7 +465,7 @@ You are a voice command parser for an Indian AI assistant that handles:
 The transcript may be in Hindi, English, Kannada, Telugu, Tamil, Malayalam, or code-mixed.
 Return ONLY valid JSON — no markdown, no prose, no <think> tags:
 {
-  "task": "train_status" | "train_search" | "shopping_orders" | "cricket" | "weather" | "blinkit" | "unknown",
+  "task": "train_status" | "train_search" | "shopping_orders" | "cricket" | "weather" | "blinkit" | "blinkit_planner" | "unknown",
   "reply_language": "hi-IN" | "en-IN" | "kn-IN" | "te-IN" | "ta-IN" | "ml-IN",
   "confidence": 0.0–1.0,
   "train_number": "NNNNN" or null,
@@ -461,6 +476,12 @@ Return ONLY valid JSON — no markdown, no prose, no <think> tags:
   "platform": "amazon" | "flipkart" | "all" or null,
   "shopping_action": "orders" | "cart" | "wishlist" | "saved_items" | "buy_again" | "browsing_history" | "invoices" or null,
   "shopping_query": "the complete requested read-only shopping action in English" or null,
+  "grocery_mode": "meal_plan" | "missing_ingredients" | "household_restock" or null,
+  "grocery_request": "meal, recipe, or restock request in English" or null,
+  "pantry_items": ["items the user explicitly says they already have"] or [],
+  "grocery_items": [
+    {"name": "ingredient name", "search_query": "specific Blinkit search", "quantity": 1, "required_amount": "recipe amount", "reason": "why needed"}
+  ],
   "city": "city name" or null,
   "weather_question": "specific weather aspect asked" or null,
   "product": "product name" or null,
@@ -478,6 +499,16 @@ Rules:
   and orders for order history/tracking/delivery. Set platform to the named site, or "all" when both
   are explicitly requested. Never reinterpret cart, wishlist, or history as orders.
   Returns, cancellations, checkout, quantity changes, and other write actions are unsupported.
+- blinkit_planner: requests to cook a meal/recipe, identify missing ingredients, build a grocery cart,
+  or restock a household. Use missing_ingredients when the user asks what is missing or lists pantry
+  items they already own; use household_restock for weekly/home restocking; otherwise use meal_plan.
+  Create a practical, complete grocery_items list in English, excluding pantry_items. Prefer common
+  Indian pack sizes and cap the list at 12 essential items. quantity is ONLY the number of purchasable
+  packs, must be an integer from 1 to 6, and should normally be 1. Put grams, litres, pieces, and recipe
+  amounts only in required_amount, never in quantity. Examples: biryani -> basmati rice, protein/paneer,
+  onions, tomatoes, curd, biryani masala,
+  ginger-garlic paste, mint, coriander, cooking oil; pasta -> pasta, pasta sauce/tomatoes, garlic,
+  onion, cheese, olive oil, herbs. Do not include water, salt, or optional garnish unless requested.
 - train_status: mentions of train/rail/railu/gaadi/train numbers, "kahan hai", "late", "running status",
   "ಯಾವ station", "எங்கே", spoken numbers ("baais chhe nau ek" = 22691)
 - cricket: "cricket", "match", "score", "IPL", "test", "wicket", "run", team/player names,
@@ -502,7 +533,7 @@ Rules:
         resp = await self.chat(
             system=system,
             user=f"Current date: {date.today().isoformat()}\nTranscript: {transcript}",
-            max_tokens=768,
+            max_tokens=1536,
         )
         raw = resp.text.strip()
         import re as _re, json as _json
@@ -515,6 +546,9 @@ Rules:
 
         try:
             result = _json.loads(text)
+            script_language = _language_from_script(transcript)
+            if script_language:
+                result["reply_language"] = script_language
             print(f"  [intent] {result}", flush=True)
             return result
         except _json.JSONDecodeError:
@@ -524,6 +558,9 @@ Rules:
             try:
                 result = _json.loads(candidate)
                 if "task" in result:
+                    script_language = _language_from_script(transcript)
+                    if script_language:
+                        result["reply_language"] = script_language
                     print(f"  [intent] rescued {result}", flush=True)
                     return result
             except _json.JSONDecodeError:
@@ -545,6 +582,10 @@ Rules:
                 "platform":         None,
                 "shopping_action":  None,
                 "shopping_query":   None,
+                "grocery_mode":     None,
+                "grocery_request":  None,
+                "pantry_items":     [],
+                "grocery_items":    [],
                 "city":             None,
                 "weather_question": None,
                 "product":          None,
@@ -555,7 +596,8 @@ Rules:
         return {"task": "unknown", "reply_language": "hi-IN", "confidence": 0.0,
                 "train_number": None, "origin": None, "destination": None,
                 "travel_date": None, "platform": None, "shopping_action": None,
-                "shopping_query": None,
+                "shopping_query": None, "grocery_mode": None, "grocery_request": None,
+                "pantry_items": [], "grocery_items": [],
                 "city": None, "product": None, "cricket_query": None}
 
     async def generate_voice_reply(
@@ -707,6 +749,7 @@ Rules:
             "cricket":      {"hi-IN": "Cricket score mil gaya.", "kn-IN": "Cricket score sigiide.", "en-IN": "Cricket score found."},
             "weather":      {"hi-IN": "Mausam ki jaankari mil gayi.", "kn-IN": "Havamana mahiti sigiide.", "en-IN": "Weather info found."},
             "blinkit":      {"hi-IN": "Blinkit pe daam mil gaya.", "kn-IN": "Blinkit price sigiide.", "en-IN": "Blinkit price found."},
+            "blinkit_planner": {"hi-IN": "Grocery cart taiyar ho gaya.", "kn-IN": "Grocery cart siddhavayitu.", "en-IN": "The grocery cart is ready."},
         }
         return stubs.get(task_type, {}).get(reply_language, "Task completed.")
 

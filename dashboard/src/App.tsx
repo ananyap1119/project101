@@ -67,6 +67,26 @@ const SHOPPING_LABELS: Record<ShoppingActivity["action"], string> = {
   invoices: "Invoice availability",
 };
 
+type GroceryCartEntry = {
+  requested_item: string;
+  requested_amount: string;
+  requested_quantity: number;
+  product_name: string;
+  pack_size: string;
+  price: string;
+  added_quantity: number;
+  status: "added" | "unavailable" | "failed";
+};
+
+type GroceryPlannerResult = {
+  request: string;
+  mode: "meal_plan" | "missing_ingredients" | "household_restock";
+  entries: GroceryCartEntry[];
+  added_count: number;
+  unavailable_count: number;
+  message: string;
+};
+
 function ResultPanel({ answer, taskType, structured }: {
   answer: string;
   taskType: string;
@@ -175,6 +195,50 @@ function ResultPanel({ answer, taskType, structured }: {
             ))}
           </div>
         )}
+      </section>
+    );
+  }
+
+  if (taskType === "blinkit_planner" && structured) {
+    const result = structured as GroceryPlannerResult;
+    return (
+      <section className="min-w-0 overflow-hidden rounded-2xl border border-zinc-800 bg-zinc-900 p-4 sm:p-6">
+        <div className="flex flex-col gap-3 border-b border-zinc-800 pb-5 sm:flex-row sm:items-end sm:justify-between">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600">Blinkit Grocery Plan</p>
+            <h2 className="mt-2 break-words text-xl font-semibold text-zinc-100">{result.request}</h2>
+            <p className="mt-1 text-sm text-zinc-500">Cart prepared only. Checkout was not opened.</p>
+          </div>
+          <span className="w-fit rounded-full bg-emerald-500/10 px-3 py-1 text-xs font-semibold text-emerald-300">
+            {result.added_count}/{result.entries.length} added
+          </span>
+        </div>
+        <div className="mt-5 grid gap-4 lg:grid-cols-2">
+          {result.entries.map((entry, index) => (
+            <article key={`${entry.requested_item}-${index}`} className="min-w-0 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-semibold uppercase tracking-widest text-violet-400">{entry.requested_item}</p>
+                  <h3 className="mt-2 break-words text-sm font-semibold text-zinc-100">
+                    {entry.product_name || "No matching product"}
+                  </h3>
+                </div>
+                <span className={[
+                  "shrink-0 rounded-md px-2 py-1 text-xs",
+                  entry.status === "added" ? "bg-emerald-500/10 text-emerald-300" : "bg-amber-500/10 text-amber-300",
+                ].join(" ")}>
+                  {entry.status}
+                </span>
+              </div>
+              <div className="mt-4 flex flex-wrap gap-2 text-xs text-zinc-400">
+                {entry.requested_amount && <span className="rounded-md bg-zinc-800 px-2 py-1">Need: {entry.requested_amount}</span>}
+                {entry.pack_size && <span className="rounded-md bg-zinc-800 px-2 py-1">Pack: {entry.pack_size}</span>}
+                {entry.price && <span className="rounded-md bg-zinc-800 px-2 py-1">{entry.price}</span>}
+                {entry.added_quantity > 0 && <span className="rounded-md bg-zinc-800 px-2 py-1">Qty: {entry.added_quantity}</span>}
+              </div>
+            </article>
+          ))}
+        </div>
       </section>
     );
   }
