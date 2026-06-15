@@ -65,6 +65,25 @@ _TRAIN_NUMBER_WORDS = {
     "shunya": "0", "sunya": "0", "ek": "1", "do": "2", "teen": "3",
     "char": "4", "chaar": "4", "panch": "5", "paanch": "5", "che": "6",
     "chhe": "6", "chhah": "6", "saat": "7", "aath": "8", "nau": "9",
+    "जीरो": "0", "ज़ीरो": "0", "शून्य": "0", "सुन्य": "0", "ओ": "0",
+    "एक": "1", "वन": "1", "वान": "1",
+    "दो": "2", "टू": "2", "टु": "2",
+    "तीन": "3", "थ्री": "3",
+    "चार": "4", "फोर": "4", "फ़ोर": "4",
+    "पांच": "5", "पाँच": "5", "फाइव": "5",
+    "छः": "6", "छह": "6", "छे": "6", "सिक्स": "6",
+    "सात": "7", "सेवन": "7",
+    "आठ": "8", "एट": "8",
+    "नौ": "9", "नाइन": "9",
+    "ಒಂದು": "1", "ಒನ್": "1",
+    "ಎರಡು": "2", "ಟು": "2",
+    "ಮೂರು": "3", "ತ್ರಿ": "3",
+    "ನಾಲ್ಕು": "4", "ಫೋರ್": "4",
+    "ಐದು": "5", "ಫೈವ್": "5",
+    "ಆರು": "6", "ಸಿಕ್ಸ್": "6",
+    "ಏಳು": "7", "ಸೆವನ್": "7",
+    "ಎಂಟು": "8", "ಎಯ್ಟ್": "8",
+    "ಒಂಬತ್ತು": "9", "ನೈನ್": "9",
 }
 
 
@@ -90,7 +109,11 @@ def _train_number_from_transcript(transcript: str) -> str | None:
         if 4 <= len(digits) <= 5:
             return digits
 
-    tokens = re.findall(r"[a-zA-Z]+", transcript.lower())
+    tokens = [
+        token.strip("\"'()[]{}")
+        for token in re.split(r"[\s,.;!?…।]+", transcript.lower())
+        if token.strip("\"'()[]{}")
+    ]
     digit_runs: list[str] = []
     current = ""
     for token in tokens:
@@ -549,6 +572,10 @@ Rules:
             script_language = _language_from_script(transcript)
             if script_language:
                 result["reply_language"] = script_language
+            fallback_train_number = _train_number_from_transcript(transcript)
+            if result.get("task") == "train_status" and fallback_train_number:
+                result["train_number"] = fallback_train_number
+                result["confidence"] = max(float(result.get("confidence") or 0.0), 0.9)
             print(f"  [intent] {result}", flush=True)
             return result
         except _json.JSONDecodeError:
@@ -561,6 +588,10 @@ Rules:
                     script_language = _language_from_script(transcript)
                     if script_language:
                         result["reply_language"] = script_language
+                    fallback_train_number = _train_number_from_transcript(transcript)
+                    if result.get("task") == "train_status" and fallback_train_number:
+                        result["train_number"] = fallback_train_number
+                        result["confidence"] = max(float(result.get("confidence") or 0.0), 0.9)
                     print(f"  [intent] rescued {result}", flush=True)
                     return result
             except _json.JSONDecodeError:
