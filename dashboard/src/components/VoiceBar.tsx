@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Mic } from "lucide-react";
+import { apiUrl } from "../lib/api";
 
 export type IntentResult = {
   run_id: string | null;
@@ -144,7 +145,7 @@ export function VoiceBar({ disabled, onRunStarted }: Props) {
     form.append("language_hint", sttLangRef.current);
 
     try {
-      const resp = await fetch("http://localhost:8000/voice", { method: "POST", body: form });
+      const resp = await fetch(apiUrl("/voice"), { method: "POST", body: form });
       if (!resp.ok) {
         let detail = `Server error ${resp.status}`;
         try { const b = await resp.json(); if (typeof b?.detail === "string") detail = b.detail; } catch {}

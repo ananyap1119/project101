@@ -2,6 +2,7 @@ import { Volume2 } from "lucide-react";
 import { useRef, useState, useEffect } from "react";
 import { AgentSnapshot } from "./components/AgentPane";
 import { VoiceBar } from "./components/VoiceBar";
+import { apiUrl } from "./lib/api";
 import { AgentName, MeterEvent, connectRunStream } from "./lib/sse";
 
 const emptySnapshot: AgentSnapshot = {
@@ -442,7 +443,7 @@ export default function App() {
   useEffect(() => {
     const id = window.setInterval(async () => {
       try {
-        const r = await fetch("http://localhost:8000/benchmark-results");
+        const r = await fetch(apiUrl("/benchmark-results"));
         if (r.ok) {
           const p = await r.json() as { results: BenchmarkResult[] };
           setBenchmarkResults(p.results);
@@ -458,7 +459,7 @@ export default function App() {
 
   async function triggerVoiceReply(rid: string, success: boolean, replyLang: string, taskType: string, extracted: string, question: string) {
     try {
-      const resp = await fetch("http://localhost:8000/voice/reply", {
+      const resp = await fetch(apiUrl("/voice/reply"), {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ run_id: rid, success, reply_language: replyLang, task_type: taskType, extracted_answer: extracted, user_question: question }),
       });

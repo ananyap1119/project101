@@ -1,3 +1,5 @@
+import { apiUrl } from "./api";
+
 export type AgentName = "baseline" | "optimized";
 
 export type MeterEvent = {
@@ -20,7 +22,7 @@ export function connectRunStream(
   onEvent: (event: MeterEvent) => void,
   onDone: () => void,
 ): EventSource {
-  const source = new EventSource(`http://localhost:8000/stream/${runId}`);
+  const source = new EventSource(apiUrl(`/stream/${runId}`));
 
   const handle = (event: Event) => {
     const message = event as MessageEvent<string>;
