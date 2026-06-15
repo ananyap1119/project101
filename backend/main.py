@@ -9,6 +9,10 @@ import sys
 import tempfile
 import time
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 # Playwright spawns Chromium via create_subprocess_exec which requires ProactorEventLoop on Windows.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())

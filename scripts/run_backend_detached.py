@@ -2,6 +2,10 @@ from pathlib import Path
 import sys
 import traceback
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 log = Path("backend.detached.bootstrap.log")
