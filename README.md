@@ -4,7 +4,7 @@ Computer-use agent benchmark harness for comparing a strawman screenshot-loop ag
 
 ## Demo
 1. computer-use-agent : https://x.com/AnanNo_11/status/2072218934389113170?s=20
-2. benchmark comparison : https://x.com/AnanNo_11/status/2072590289823494479?s=20
+2. benchmark comparison : https://x.com/AnanNo_11/status/2073026420700500406?s=20
 
 
 ## Stack
