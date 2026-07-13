@@ -16,6 +16,25 @@ Computer-use agent benchmark harness for comparing a strawman screenshot-loop ag
 - Vite, React, Tailwind dashboard
 - Server-sent events at `GET /stream/{run_id}`
 
+# Description
+
+Project101 is a multilingual AI web agent built to navigate complex Indian government, enterprise, and consumer websites through natural voice commands.
+
+Instead of requiring users to search through multiple websites and forms, Project101 understands spoken instructions, plans the required actions, and completes tasks directly in the browser.
+
+The project focuses on making AI systems practical for Indian users while remaining fast and cost-efficient. It uses a model cascade architecture to reduce unnecessary large-model calls, improving both latency and inference cost without sacrificing task completion.
+
+### Highlights
+
+- 🌏 Multilingual voice interaction
+- 🖥️ Browser automation for real-world websites
+- 🧠 Model cascade for efficient inference
+- ⚡ 4.15× fewer tokens
+- 💰 3.05× lower cost
+- 🚀 1.65× faster execution
+
+Project101 was built as an exploration into practical AI agents that can reliably interact with complex web interfaces rather than functioning only as conversational assistants.
+
 ## Setup
 
 Install prerequisites:
