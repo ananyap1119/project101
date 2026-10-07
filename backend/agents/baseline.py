@@ -271,6 +271,21 @@ class BaselineAgent:
                             action = {"action": "press", "key": "Enter"}
 
                     done = await _execute_action(page, action)
+                    if self.mode == "competent" and step == 1 and getattr(task, "name", "") == "ntes":
+                        try:
+                            from backend.agents.optimized import _prepare_ntes_train_status
+
+                            if await _prepare_ntes_train_status(page, task):
+                                print("  [baseline-competent] deterministic NTES setup applied", flush=True)
+                                await asyncio.sleep(5)
+                                page_body = await page.inner_text("body")
+                                final_page_text = page_body
+                                if task.success(page_body):
+                                    success = True
+                                    final_step_desc = f"status_found_after_ntes_setup_step_{step}"
+                                    break
+                        except Exception as exc:
+                            print(f"  [baseline-competent] NTES setup fallback failed: {exc}", flush=True)
                     if done:
                         await asyncio.sleep(2)
                         page_body = await page.inner_text("body")
@@ -420,7 +435,24 @@ async def _execute_action(page, action: dict) -> bool:
             except Exception:
                 pass
         elif kind == "type":
-            await page.keyboard.type(str(action.get("text", "")), delay=25)
+            text = str(action.get("text", ""))
+            typed = False
+            try:
+                active_is_text_field = await page.evaluate(
+                    """() => {
+                        const el = document.activeElement;
+                        if (!el) return false;
+                        const tag = String(el.tagName || '').toLowerCase();
+                        return tag === 'input' || tag === 'textarea' || el.isContentEditable;
+                    }"""
+                )
+                if not active_is_text_field:
+                    await page.locator("input:visible, textarea:visible").first.fill(text, timeout=2_000)
+                    typed = True
+            except Exception:
+                typed = False
+            if not typed:
+                await page.keyboard.type(text, delay=25)
         elif kind == "press":
             await page.keyboard.press(str(action.get("key", "Enter")))
             try:

@@ -91,7 +91,7 @@ def _to_openai_messages(system: str, messages: list[dict]) -> list[dict]:
 
 class OpenRouterClient:
     def __init__(self) -> None:
-        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+        api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
         if not api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not set")
         self._http = httpx.AsyncClient(

@@ -97,6 +97,7 @@ class NTESTask(BaseModel):
     train_number: str = TRAIN_NUMBER
     headed: bool = False
     speculation_enabled: bool = False
+    benchmark_force_model_step: bool = False
 
     @property
     def objective(self) -> str:

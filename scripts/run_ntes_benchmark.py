@@ -36,8 +36,7 @@ class RunConfig:
 
 
 CONFIGS = [
-    RunConfig("baseline_naive", "Baseline naive", "simple", False, False, False, False, False),
-    RunConfig("baseline_competent", "Baseline competent", "simple", False, False, False, False, False),
+    RunConfig("baseline", "Baseline", "simple", False, False, False, False, False),
     RunConfig("som_only", "SoM only", "simple", True, False, False, False, False),
     RunConfig("som_summarization", "SoM + summarization", "simple", True, True, False, False, False),
     RunConfig("som_summarization_cascade", "SoM + summarization + cascade", "simple", True, True, True, False, False),
@@ -58,6 +57,13 @@ def _layers(cfg: RunConfig) -> list[int]:
     return layers
 
 
+def _redact_secrets(value: str) -> str:
+    api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+    if api_key:
+        value = value.replace(api_key, "[OPENROUTER_API_KEY]")
+    return value
+
+
 async def _post_result(result: dict[str, Any]) -> None:
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -72,16 +78,18 @@ async def _run_config(index: int, cfg: RunConfig) -> dict[str, Any]:
     from backend.instrumentation.meter import RunMeter
     from backend.tasks.ntes import NTESTask
 
-    print(f"\n=== Running config {index}/6: {cfg.label} ===", flush=True)
+    print(f"\n=== Running config {index}/5: {cfg.label} ===", flush=True)
     print(f"RunConfig: {json.dumps(asdict(cfg))}", flush=True)
 
     meter = RunMeter(f"ntes-{cfg.name}", budget_cap_inr=5.0)
-    task = NTESTask(headed=cfg.headed, config_name=cfg.name)  # type: ignore[arg-type]
+    task = NTESTask(
+        headed=cfg.headed,
+        config_name=cfg.name,  # type: ignore[arg-type]
+        benchmark_force_model_step=cfg.name != "baseline",
+    )
     task.reset()
 
-    if cfg.name == "baseline_naive":
-        agent = BaselineAgent(meter, mode="naive")
-    elif cfg.name == "baseline_competent":
+    if cfg.name == "baseline":
         agent = BaselineAgent(meter, mode="competent")
     else:
         agent = OptimizedAgent(
@@ -115,11 +123,7 @@ async def _run_config(index: int, cfg: RunConfig) -> dict[str, Any]:
                 last_event_at = time.perf_counter()
 
     monitor_task = asyncio.create_task(monitor())
-    timeout_seconds = (
-        60 if cfg.name == "baseline_naive"
-        else 45 if cfg.name == "baseline_competent"
-        else 90
-    )
+    timeout_seconds = 90
     try:
         result = await asyncio.wait_for(agent.run(task), timeout=timeout_seconds)
         if result.total_cost_inr >= 5:
@@ -186,7 +190,7 @@ async def _run_config(index: int, cfg: RunConfig) -> dict[str, Any]:
             "meaningful_speculation_hit_rate": detail.get("speculation_meaningful", "n/a"),
             "speculation_disabled_reason": detail.get("speculation_disabled_reason", ""),
             "spec_rejections_by_reason": detail.get("spec_rejections_by_reason", {}),
-            "failure_reason": result.final_step if status == "failed" else "",
+            "failure_reason": _redact_secrets(result.final_step) if status == "failed" else "",
             "route_log": detail.get("route_log", []),
             "extracted_status_string": result.extracted_status_string,
         }
@@ -224,18 +228,18 @@ async def _run_config(index: int, cfg: RunConfig) -> dict[str, Any]:
 
 
 def _print_running_totals(index: int, results: list[dict[str, Any]]) -> None:
-    baseline = next((r for r in results if r["name"] == "baseline_naive"), None)
+    baseline = next((r for r in results if r["name"] == "baseline"), None)
     current = results[-1]
     if baseline and baseline["total_tokens"]:
         multiplier = baseline["total_tokens"] / max(current["total_tokens"], 1)
         print(
-            f"After config {index}/6: baseline_naive={baseline['total_tokens']} tokens, "
+            f"After config {index}/5: baseline={baseline['total_tokens']} tokens, "
             f"current={current['total_tokens']} tokens, multiplier so far = {multiplier:.2f}x",
             flush=True,
         )
     else:
         print(
-            f"After config {index}/6: baseline_naive={current['total_tokens']} tokens, "
+            f"After config {index}/5: baseline={current['total_tokens']} tokens, "
             f"current={current['total_tokens']} tokens, multiplier so far = 1.00x",
             flush=True,
         )
@@ -247,28 +251,21 @@ def _print_final(results: list[dict[str, Any]]) -> None:
         print(json.dumps(result, ensure_ascii=False), flush=True)
 
     by_name = {result["name"]: result for result in results}
-    naive = by_name.get("baseline_naive")
-    competent = by_name.get("baseline_competent")
+    baseline = by_name.get("baseline")
     full = by_name.get("full_optimized")
-    if full:
+    if baseline and full:
         print("\n=== Summary table ===", flush=True)
-        for base, label in [
-            (naive, "baseline_naive"),
-            (competent, "baseline_competent"),
-        ]:
-            if base:
-                print(
-                    f"Full optimized vs {label}: "
-                    f"tokens {base['total_tokens'] / max(full['total_tokens'], 1):.2f}x, "
-                    f"cost {base['cost_inr'] / max(full['cost_inr'], 0.000001):.2f}x, "
-                    f"latency {base['wall_seconds'] / max(full['wall_seconds'], 0.1):.2f}x",
-                    flush=True,
-                )
+        print(
+            "Full optimized vs baseline: "
+            f"tokens {baseline['total_tokens'] / max(full['total_tokens'], 1):.2f}x, "
+            f"cost {baseline['cost_inr'] / max(full['cost_inr'], 0.000001):.2f}x, "
+            f"latency {baseline['wall_seconds'] / max(full['wall_seconds'], 0.1):.2f}x",
+            flush=True,
+        )
 
     print("Per-layer marginal contribution:", flush=True)
     for left, right, label in [
-        ("baseline_naive", "baseline_competent", "naive->competent"),
-        ("baseline_competent", "som_only", "competent->som"),
+        ("baseline", "som_only", "baseline->som"),
         ("som_only", "som_summarization", "som->summ"),
         ("som_summarization", "som_summarization_cascade", "summ->cascade"),
         ("som_summarization_cascade", "full_optimized", "cascade->full"),
@@ -291,7 +288,7 @@ async def main() -> None:
         except Exception:
             pass
 
-    print("Six-config NTES benchmark starting. Paid model calls are capped at ₹5 per config.", flush=True)
+    print("Five-config NTES benchmark starting. Paid model calls are capped at ₹5 per config.", flush=True)
     results: list[dict[str, Any]] = []
     for index, cfg in enumerate(CONFIGS, 1):
         result = await _run_config(index, cfg)

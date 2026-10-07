@@ -101,8 +101,7 @@ async def run_once(layers: list[int], *, headed: bool, mock: bool) -> dict:
         "total_tokens": result.total_input_tokens + result.total_output_tokens,
         "cost_inr": result.total_cost_inr,
         "wall_s": round(wall_s, 1),
-        "sarvam_calls": cascade.sarvam_calls,
-        "claude_calls": cascade.claude_calls,
+        "tier_calls": list(cascade.tier_calls),
         "cascade_ratio": cascade.ratio_str() if cascade.total else "n/a",
         "final_step": result.final_step,
     }

@@ -1,6 +1,6 @@
-import { Volume2 } from "lucide-react";
+import { Play, Volume2 } from "lucide-react";
 import { useRef, useState, useEffect } from "react";
-import { AgentSnapshot } from "./components/AgentPane";
+import { AgentPane, AgentSnapshot } from "./components/AgentPane";
 import { VoiceBar } from "./components/VoiceBar";
 import { apiUrl } from "./lib/api";
 import { AgentName, MeterEvent, connectRunStream } from "./lib/sse";
@@ -18,10 +18,31 @@ type BenchmarkResult = {
   name: string;
   label: string;
   status: string;
+  vision_tokens?: number;
+  context_tokens?: number;
   total_tokens: number;
   cost_inr: number;
   wall_seconds: number;
 };
+
+function snapshotFromBenchmark(result: BenchmarkResult, model: string): AgentSnapshot {
+  return {
+    visionTokens: result.vision_tokens ?? result.total_tokens,
+    contextTokens: result.context_tokens ?? 0,
+    cumulativeCostInr: result.cost_inr,
+    elapsedSeconds: result.wall_seconds,
+    currentStep: result.status,
+    currentModel: model,
+    latencyMs: Math.round(result.wall_seconds * 1000),
+    status: result.status === "completed"
+      ? "completed"
+      : result.status === "timeout"
+        ? "timeout"
+      : result.status === "failed"
+        ? "failed"
+        : "running",
+  };
+}
 
 type TrainOption = {
   number: string;
@@ -252,10 +273,11 @@ function ResultPanel({ answer, taskType, structured }: {
   );
 }
 
-// ── Minimal agent row (voice tab sidebar) ─────────────────────────────────────
+// -- Minimal agent row (voice tab sidebar) -------------------------------------
 function AgentRow({ label, snapshot }: { label: string; snapshot: AgentSnapshot }) {
   const dot =
     snapshot.status === "completed" ? "bg-emerald-400"
+    : snapshot.status === "timeout" ? "bg-amber-400"
     : snapshot.status === "failed"  ? "bg-red-400"
     : snapshot.status === "running" ? "bg-violet-400 animate-pulse"
     : "bg-zinc-700";
@@ -285,7 +307,7 @@ function AgentRow({ label, snapshot }: { label: string; snapshot: AgentSnapshot 
   );
 }
 
-// ── Full benchmark panel (benchmark tab) ──────────────────────────────────────
+// -- Full benchmark panel (benchmark tab) --------------------------------------
 function MetricBlock({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 px-5 py-4">
@@ -355,54 +377,60 @@ function BenchmarkPane({ title, subtitle, accent, snapshot }: {
 
 function ComparisonBanner({ snapshots }: { snapshots: Snapshots }) {
   const b = snapshots.baseline, o = snapshots.optimized;
-  const hasCost = b.cumulativeCostInr > 0 && o.cumulativeCostInr > 0;
+  const baselineTokens = b.visionTokens + b.contextTokens;
+  const optimizedTokens = o.visionTokens + o.contextTokens;
+  const hasTokens = baselineTokens > 0;
+  const hasCost = b.cumulativeCostInr > 0;
   const hasTime = b.elapsedSeconds > 0 && o.elapsedSeconds > 0;
-  if (!hasCost && !hasTime) return null;
-  const cheaper = hasCost ? b.cumulativeCostInr / o.cumulativeCostInr : null;
-  const faster  = hasTime ? b.elapsedSeconds / o.elapsedSeconds : null;
-  const done    = b.status === "completed" && o.status === "completed";
+  if (!hasTokens && !hasCost && !hasTime) return null;
+  const tokenSavings = hasTokens ? Math.max(0, 1 - optimizedTokens / baselineTokens) * 100 : null;
+  const costSavings = hasCost ? Math.max(0, 1 - o.cumulativeCostInr / b.cumulativeCostInr) * 100 : null;
+  const faster = hasTime && b.elapsedSeconds > o.elapsedSeconds ? b.elapsedSeconds / o.elapsedSeconds : null;
+  const done = b.status === "completed" && o.status === "completed";
+  const qualifier = done ? "" : " so far";
   return (
-    <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-6 flex flex-wrap gap-8 col-span-full">
-      {cheaper !== null && (
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600">
-            Cost savings{!done ? " so far" : ""}
-          </p>
-          <p className="mt-1 text-5xl font-bold text-emerald-400">{cheaper.toFixed(1)}×</p>
-          <p className="text-xs text-zinc-600 mt-1">cheaper</p>
-        </div>
+    <div className="col-span-full flex flex-wrap items-center justify-center gap-6 rounded-lg border border-line bg-panel px-6 py-4 text-center shadow-sm">
+      {tokenSavings !== null && (
+        <span className="text-base font-medium text-ink">
+          Optimised uses <span className="text-2xl font-bold text-emerald-600">{tokenSavings.toFixed(0)}%</span> fewer tokens{qualifier}
+        </span>
+      )}
+      {tokenSavings !== null && costSavings !== null && (
+        <span className="text-xl text-slate-300">|</span>
+      )}
+      {costSavings !== null && (
+        <span className="text-base font-medium text-ink">
+          Optimised is <span className="text-2xl font-bold text-emerald-600">{costSavings.toFixed(0)}%</span> cheaper{qualifier}
+        </span>
+      )}
+      {(tokenSavings !== null || costSavings !== null) && faster !== null && (
+        <span className="text-xl text-slate-300">|</span>
       )}
       {faster !== null && (
-        <div>
-          <p className="text-xs font-semibold uppercase tracking-widest text-zinc-600">
-            Speed gain{!done ? " so far" : ""}
-          </p>
-          <p className="mt-1 text-5xl font-bold text-violet-400">{faster.toFixed(1)}×</p>
-          <p className="text-xs text-zinc-600 mt-1">faster</p>
-        </div>
+        <span className="text-base font-medium text-ink">
+          Optimised is <span className="text-2xl font-bold text-blue-600">{faster.toFixed(1)}x</span> faster{qualifier}
+        </span>
       )}
     </div>
   );
 }
-
-// ── Benchmark bar chart ───────────────────────────────────────────────────────
 function BenchmarkChart({ results }: { results: BenchmarkResult[] }) {
   if (results.length === 0) {
     return (
-      <div className="rounded-2xl border border-zinc-800 border-dashed p-8 text-center col-span-full">
-        <p className="text-sm text-zinc-600">Run a benchmark to see results here.</p>
+      <div className="col-span-full rounded-lg border border-dashed border-line bg-panel p-8 text-center shadow-sm">
+        <p className="text-sm text-slate-600">Waiting for the first config result.</p>
       </div>
     );
   }
   const maxTokens = Math.max(...results.map(r => r.total_tokens), 1);
   return (
-    <div className="rounded-2xl bg-zinc-900 border border-zinc-800 p-6 col-span-full space-y-1">
+    <div className="col-span-full space-y-1 rounded-lg border border-line bg-panel p-5 shadow-sm">
       <div className="flex items-end justify-between mb-6">
         <div>
-          <h2 className="text-base font-semibold text-zinc-100">Benchmark Comparison</h2>
-          <p className="text-xs text-zinc-600 mt-0.5">Bars appear as each config completes.</p>
+          <h2 className="text-xl font-semibold text-ink">Benchmark Comparison</h2>
+          <p className="mt-1 text-sm text-slate-600">Bars appear as each config completes.</p>
         </div>
-        <span className="text-xs text-zinc-500">{results.length}/5 complete</span>
+        <span className="text-sm font-medium text-slate-600">{results.length}/5 complete</span>
       </div>
       <div className="space-y-5">
         {results.map(r => {
@@ -411,14 +439,14 @@ function BenchmarkChart({ results }: { results: BenchmarkResult[] }) {
           return (
             <div key={r.name}>
               <div className="flex items-center justify-between mb-2 gap-4">
-                <span className="text-sm font-medium text-zinc-200 min-w-0 truncate">{r.label}</span>
-                <span className="text-xs text-zinc-500 flex-shrink-0 font-mono">
+                <span className="min-w-0 truncate text-sm font-semibold text-ink">{r.label}</span>
+                <span className="flex-shrink-0 text-xs text-slate-600">
                   {r.status} · {r.total_tokens.toLocaleString()} tok · ₹{r.cost_inr.toFixed(4)} · {r.wall_seconds.toFixed(1)}s
                 </span>
               </div>
-              <div className="h-2 rounded-full bg-zinc-800 overflow-hidden">
+              <div className="h-3 overflow-hidden rounded-full bg-slate-200">
                 <div
-                  className={`h-full rounded-full transition-all ${done ? "bg-emerald-500" : "bg-zinc-600"}`}
+                  className={`h-full rounded-full transition-all ${done ? "bg-mint" : "bg-slate-400"}`}
                   style={{ width: `${width}%` }}
                 />
               </div>
@@ -430,13 +458,15 @@ function BenchmarkChart({ results }: { results: BenchmarkResult[] }) {
   );
 }
 
-// ── Main app ──────────────────────────────────────────────────────────────────
+// -- Main app ------------------------------------------------------------------
 export default function App() {
   const [tab, setTab]                       = useState<Tab>("voice");
   const [isRunning, setIsRunning]           = useState(false);
   const [isPlayingReply, setIsPlayingReply] = useState(false);
   const [snapshots, setSnapshots]           = useState<Snapshots>({ baseline: emptySnapshot, optimized: emptySnapshot });
   const [benchmarkResults, setBenchmarkResults] = useState<BenchmarkResult[]>([]);
+  const [benchmarkStarting, setBenchmarkStarting] = useState(false);
+  const [benchmarkError, setBenchmarkError]       = useState("");
   const [latestAnswer, setLatestAnswer]         = useState("");
   const [latestStructured, setLatestStructured] = useState<unknown>(null);
 
@@ -447,6 +477,18 @@ export default function App() {
         if (r.ok) {
           const p = await r.json() as { results: BenchmarkResult[] };
           setBenchmarkResults(p.results);
+          const baseline = p.results.find((item) => item.name === "baseline");
+          const full = p.results.find((item) => item.name === "full_optimized");
+          if (baseline || full) {
+            setSnapshots((current) => ({
+              baseline: baseline
+                ? snapshotFromBenchmark(baseline, "Qwen3-VL via OpenRouter")
+                : current.baseline,
+              optimized: full
+                ? snapshotFromBenchmark(full, "DeepSeek-first cascade")
+                : current.optimized,
+            }));
+          }
         }
       } catch {}
     }, 1500);
@@ -456,6 +498,28 @@ export default function App() {
   const sourceRef      = useRef<EventSource | null>(null);
   const voiceMetaRef   = useRef<{ taskType: string; replyLang: string; transcript: string } | null>(null);
   const replyCalledRef = useRef<Set<string>>(new Set());
+
+  async function startBenchmark() {
+    setBenchmarkStarting(true);
+    setBenchmarkError("");
+    setBenchmarkResults([]);
+    setSnapshots({
+      baseline: { ...emptySnapshot, status: "running", currentStep: "benchmark queued" },
+      optimized: { ...emptySnapshot, status: "running", currentStep: "benchmark queued" },
+    });
+    try {
+      const resp = await fetch(apiUrl("/benchmark-run"), { method: "POST" });
+      if (!resp.ok) {
+        const payload = await resp.json().catch(() => ({})) as { detail?: string };
+        throw new Error(payload.detail || `Backend returned ${resp.status}`);
+      }
+    } catch (caught) {
+      setBenchmarkError(caught instanceof Error ? caught.message : "Unable to start benchmark");
+      setSnapshots({ baseline: emptySnapshot, optimized: emptySnapshot });
+    } finally {
+      setBenchmarkStarting(false);
+    }
+  }
 
   async function triggerVoiceReply(rid: string, success: boolean, replyLang: string, taskType: string, extracted: string, question: string) {
     try {
@@ -516,8 +580,13 @@ export default function App() {
     }
   }
 
+  const benchmarkMode = tab === "benchmark";
+
   return (
-    <div className="min-h-screen overflow-x-hidden bg-zinc-950 text-zinc-50">
+    <div className={[
+      "min-h-screen overflow-x-hidden",
+      benchmarkMode ? "bg-slate-50 text-ink" : "bg-zinc-950 text-zinc-50",
+    ].join(" ")}>
       <div className="mx-auto w-full max-w-7xl px-4 py-8 sm:px-6 lg:px-8 xl:py-12">
 
         {/* Header */}
@@ -574,7 +643,7 @@ export default function App() {
                     <div>
                       <p className="text-xs text-zinc-600 uppercase tracking-widest">cheaper</p>
                       <p className="text-3xl font-bold text-emerald-400">
-                        {(snapshots.baseline.cumulativeCostInr / snapshots.optimized.cumulativeCostInr).toFixed(1)}×
+                        {(snapshots.baseline.cumulativeCostInr / snapshots.optimized.cumulativeCostInr).toFixed(1)}x
                       </p>
                     </div>
                   )}
@@ -587,17 +656,41 @@ export default function App() {
         {/* Benchmark tab */}
         {tab === "benchmark" && (
           <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
-            <BenchmarkPane
-              title="Optimised · DeepSeek Cascade"
-              subtitle="DOM text · summarised history · 4-tier model routing"
-              accent="violet"
-              snapshot={snapshots.optimized}
-            />
-            <BenchmarkPane
+            <div className="col-span-full flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <h2 className="text-3xl font-semibold tracking-normal text-ink">LLM Benchmark</h2>
+                <p className="mt-1 text-sm text-slate-600">
+                  Five configurations: baseline, SoM, summarization, cascade, and full optimized.
+                </p>
+              </div>
+              <button
+                className="inline-flex h-11 items-center justify-center gap-2 rounded-md bg-ink px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+                disabled={benchmarkStarting}
+                onClick={startBenchmark}
+                type="button"
+              >
+                <Play size={17} />
+                {benchmarkStarting ? "Starting..." : "Run Benchmark"}
+              </button>
+            </div>
+
+            {benchmarkError && (
+              <div className="col-span-full rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+                {benchmarkError}
+              </div>
+            )}
+
+            <AgentPane
               title="Baseline · Qwen3-VL-235B"
-              subtitle="Full 1080p screenshots · full history · single model"
-              accent="amber"
+              subtitle="Full 1080p PNG every step · Full conversation history · OpenRouter"
+              accent="coral"
               snapshot={snapshots.baseline}
+            />
+            <AgentPane
+              title="Optimised · DeepSeek-first Cascade"
+              subtitle="DOM text (no images) · Summarised history · DeepSeek to Qwen to Claude · Speculation"
+              accent="mint"
+              snapshot={snapshots.optimized}
             />
             <ComparisonBanner snapshots={snapshots} />
             <BenchmarkChart results={benchmarkResults} />

@@ -10,7 +10,7 @@ export type AgentSnapshot = {
   currentStep: string;
   currentModel: string;
   latencyMs: number;
-  status: "idle" | "running" | "completed" | "failed";
+  status: "idle" | "running" | "completed" | "failed" | "timeout";
 };
 
 type AgentPaneProps = {
@@ -24,6 +24,8 @@ export function AgentPane({ title, subtitle, accent, snapshot }: AgentPaneProps)
   const badgeClass =
     snapshot.status === "completed"
       ? "bg-emerald-100 text-emerald-700"
+      : snapshot.status === "timeout"
+        ? "bg-amber-100 text-amber-700"
       : snapshot.status === "failed"
         ? "bg-red-100 text-red-700"
         : snapshot.status === "running"

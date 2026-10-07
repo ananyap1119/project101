@@ -211,6 +211,7 @@ app.add_middleware(
 RUNS: dict[str, dict[str, Any]] = {}
 METERS: dict[str, RunMeter] = {}
 BENCHMARK_RESULTS: list[dict[str, Any]] = []
+BENCHMARK_PROCESS: asyncio.subprocess.Process | None = None
 
 
 @app.get("/health")
@@ -233,6 +234,35 @@ async def add_benchmark_result(result: dict[str, Any]) -> dict[str, str]:
 async def clear_benchmark_results() -> dict[str, str]:
     BENCHMARK_RESULTS.clear()
     return {"status": "ok"}
+
+
+async def _watch_benchmark_process(process: asyncio.subprocess.Process) -> None:
+    global BENCHMARK_PROCESS
+    await process.wait()
+    if BENCHMARK_PROCESS is process:
+        BENCHMARK_PROCESS = None
+
+
+@app.post("/benchmark-run")
+async def run_benchmark() -> dict[str, str]:
+    global BENCHMARK_PROCESS
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        raise HTTPException(status_code=400, detail="OPENROUTER_API_KEY is not set")
+    if BENCHMARK_PROCESS is not None and BENCHMARK_PROCESS.returncode is None:
+        return {"status": "already_running"}
+
+    root = Path(__file__).resolve().parents[1]
+    BENCHMARK_RESULTS.clear()
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+    BENCHMARK_PROCESS = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(root / "scripts" / "run_ntes_benchmark.py"),
+        cwd=str(root),
+        env=env,
+    )
+    asyncio.create_task(_watch_benchmark_process(BENCHMARK_PROCESS))
+    return {"status": "started"}
 
 
 @app.post("/run")
